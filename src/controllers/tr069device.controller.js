@@ -1,5 +1,6 @@
 const { ServiceFactory } = require('../lib/clients/ServiceFactory');
 const { SERVICE_CODES } = require('../lib/serviceConstants');
+const { invalidateGenieACSResponseCache } = require('../lib/genieacsResponseCache');
 
 // Sync TR069 devices from GenieACS to local database
 async function syncDevices(req, res, next) {
@@ -172,6 +173,7 @@ async function syncDevice(req, res, next) {
         updatedAt: new Date()
       }
     });
+    invalidateGenieACSResponseCache(req.ispId, serialNumber);
     return res.json({ success: true, message: `ACS device ${serialNumber} synchronized`, data: updated });
   } catch (err) {
     console.error('TR069 device sync error:', err);

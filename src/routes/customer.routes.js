@@ -25,6 +25,7 @@ const {
   createOwnReferral,
   assertCustomerOwnsSerial,
   updateCustomerDevice,
+  updateCustomerProvisioningStatus,
   deleteCustomerDevice,
   getCustomerRadiusAuthLogs,
   bindCustomerRadiusMac,
@@ -118,6 +119,7 @@ module.exports = (prisma) => {
     checkPermission('customer_update'),
     provisionCustomer
   );
+  router.patch('/:id/provisioning-status', checkPermission('customer_update'), updateCustomerProvisioningStatus);
 
   router.get('/', checkAnyPermission(['customer_read', 'tasks_read_self', 'tasks_update']), listCustomers);
   router.get('/summary', checkPermission('customer_read'), getCustomerStatusSummary); // New endpoint

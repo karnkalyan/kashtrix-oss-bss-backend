@@ -4034,6 +4034,29 @@ async function updateCustomerDevice(req, res, next) {
   }
 }
 
+async function updateCustomerProvisioningStatus(req, res, next) {
+  const customerId = Number(req.params.id);
+  const requestedStatus = String(req.body?.status || '').trim().toLowerCase();
+  if (!Number.isInteger(customerId)) return res.status(400).json({ error: 'Invalid customer ID' });
+  const status = { active: 'active', complete: 'active', completed: 'active', provisioned: 'active', pending: 'pending' }[requestedStatus];
+  if (!status) return res.status(400).json({ error: 'Status must be active or pending' });
+  try {
+    const customer = await req.prisma.customer.findFirst({ where: { id: customerId, ispId: req.ispId } });
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    const now = new Date();
+    const results = await req.prisma.$transaction([
+      req.prisma.customer.update({ where: { id: customerId }, data: status === 'active' ? { status: 'active', onboardStatus: 'fully_onboarded', updatedAt: now } : { updatedAt: now } }),
+      req.prisma.customerDevice.updateMany({ where: { customerId, deviceType: 'ONT' }, data: { provisioningStatus: status, updatedAt: now } }),
+      req.prisma.customerServiceConnection.updateMany({ where: { customerId }, data: { status, provisioningNotes: `${status === 'active' ? 'Completed' : 'Reset to pending'} manually by ${req.user?.email || req.user?.id || 'operator'} on ${now.toISOString()}`, updatedAt: now } })
+    ]);
+    await logAudit(req.prisma, req.user.id, 'CUSTOMER_PROVISIONING_STATUS_UPDATE', { customerId, status }, req);
+    return res.json({ success: true, message: status === 'active' ? 'Customer provisioning and assigned ONT marked active' : 'Customer provisioning and assigned ONT marked pending', data: { status, devicesUpdated: results[1].count, connectionsUpdated: results[2].count } });
+  } catch (error) {
+    console.error('updateCustomerProvisioningStatus error:', error);
+    return next(error);
+  }
+}
+
 async function deleteCustomerDevice(req, res, next) {
   const prisma = req.prisma;
   const customerId = Number(req.params.id);
@@ -5583,6 +5606,7 @@ module.exports = {
   createOwnReferral,
   getCustomerStatusSummary,
   updateCustomerDevice,
+  updateCustomerProvisioningStatus,
   deleteCustomerDevice,
   getCustomerRadiusAuthLogs,
   bindCustomerRadiusMac,

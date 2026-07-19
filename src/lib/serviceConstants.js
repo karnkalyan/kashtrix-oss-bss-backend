@@ -74,6 +74,8 @@ module.exports = {
         NETTV: [
             { credentialType: 'api_key', key: 'api_key', label: 'API Key', required: true },
             { credentialType: 'api_key', key: 'api_secret', label: 'API Secret', isEncrypted: true, required: true },
+            { credentialType: 'api_key', key: 'reseller_id', label: 'Reseller ID', required: true, isEncrypted: false },
+            { credentialType: 'username_password', key: 'reseller_username', label: 'Reseller Username', required: false, isEncrypted: false },
             { credentialType: 'api_key', key: 'base_url', label: 'Base URL', required: true }
         ],
         YEASTAR: [

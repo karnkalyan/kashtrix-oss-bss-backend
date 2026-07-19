@@ -1948,8 +1948,21 @@ async function provisionCustomer(req, res, next) {
                 });
                 break;
               case SERVICE_CODES.NETTV: {
-                result = await client.createSubscriber(data);
-                const overviewData = await client.getSubscriberOverview(data.username).catch(error => {
+                const nettvUsername = String(data?.username || '').trim();
+                if (!nettvUsername) throw new Error('NetTV username is required');
+                const nettvServiceId = await getServiceIdByCode(SERVICE_CODES.NETTV);
+                const existingLink = await prisma.customerSubscribedService.findFirst({
+                  where: { serviceId: nettvServiceId, externalUsername: nettvUsername, customerId: { not: customerId } },
+                  select: { customerId: true }
+                });
+                if (existingLink) throw new Error(`NetTV username '${nettvUsername}' is already linked to another customer`);
+                const { provisioning: nettvProvisioning, ...subscriberData } = data;
+                result = await client.createSubscriber(subscriberData);
+                if (nettvProvisioning?.stb?.serial) {
+                  await client.addSTBToSubscriber(nettvUsername, nettvProvisioning.stb);
+                  if (nettvProvisioning.package?.packages?.length) await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+                }
+                const overviewData = await client.getSubscriberOverview(nettvUsername).catch(error => {
                   console.warn('Failed to fetch full overview on NetTV provision:', error.message);
                   return null;
                 });
@@ -1965,28 +1978,33 @@ async function provisionCustomer(req, res, next) {
             // Store successful result in database (only if not already stored by the custom block)
             if (service !== SERVICE_CODES.TSHUL && service !== SERVICE_CODES.NEPURIX) {
               const serviceId = await getServiceIdByCode(service);
+              const externalUsername = service === SERVICE_CODES.NETTV ? String(data?.username || '').trim() : null;
+              const storedServiceData = service === SERVICE_CODES.NETTV ? { ...data, ...result, username: externalUsername } : result;
               await prisma.customerSubscribedService.upsert({
                 where: { customerId_serviceId: { customerId, serviceId } },
-                update: { status: 'active', serviceData: result },
+                update: { status: 'active', externalUsername, serviceData: storedServiceData },
                 create: {
                   customerId,
                   serviceId,
                   status: 'active',
-                  serviceData: result,
+                  externalUsername,
+                  serviceData: storedServiceData,
                 },
               });
             }
           } else {
             console.log(`Bypassing external push for service ${service} since pushTrialProvisionToAccount is disabled.`);
             const serviceId = await getServiceIdByCode(service);
+            const externalUsername = service === SERVICE_CODES.NETTV ? String(data?.username || '').trim() || null : null;
             await prisma.customerSubscribedService.upsert({
               where: { customerId_serviceId: { customerId, serviceId } },
-              update: { status: 'active', serviceData: { bypassed: true } },
+              update: { status: 'active', externalUsername, serviceData: { ...data, username: externalUsername, bypassed: true } },
               create: {
                 customerId,
                 serviceId,
                 status: 'active',
-                serviceData: { bypassed: true },
+                externalUsername,
+                serviceData: { ...data, username: externalUsername, bypassed: true },
               },
             });
           }
@@ -2001,7 +2019,8 @@ async function provisionCustomer(req, res, next) {
 
     // Update customer status and device/service connection statuses. This endpoint can also add
     // missing add-on services for an already-active customer.
-    if (customer.status !== 'active' || customer.onboardStatus !== 'fully_onboarded') {
+    const provisioningSucceeded = serviceResults.length > 0 && serviceResults.every(item => item.success);
+    if (provisioningSucceeded) {
       await prisma.$transaction([
         prisma.customer.update({
           where: { id: customerId },
@@ -4770,11 +4789,25 @@ async function reprovisionNettv(req, res, next) {
       : {};
     const requestNettvData = req.body?.nettvData || req.body?.data || {};
     const nettvData = { ...fallbackNettvData, ...existingNettvData, ...requestNettvData };
+    const nettvUsername = String(nettvData.username || '').trim();
+    if (!nettvUsername) return res.status(400).json({ error: 'NetTV username is required' });
+    nettvData.username = nettvUsername;
+
+    const existingLink = await prisma.customerSubscribedService.findFirst({
+      where: { serviceId, externalUsername: nettvUsername, customerId: { not: customerId } },
+      select: { customerId: true }
+    });
+    if (existingLink) return res.status(409).json({ error: `NetTV username '${nettvUsername}' is already linked to another customer` });
 
     const client = await ServiceFactory.getClient(SERVICE_CODES.NETTV, req.ispId);
     
     // Reprovision is equivalent to calling createSubscriber to upsert/update configuration on NetTV
-    const result = await client.createSubscriber(nettvData);
+    const { provisioning: nettvProvisioning, ...subscriberData } = nettvData;
+    const result = await client.createSubscriber(subscriberData);
+    if (nettvProvisioning?.stb?.serial) {
+      await client.addSTBToSubscriber(nettvUsername, nettvProvisioning.stb);
+      if (nettvProvisioning.package?.packages?.length) await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+    }
 
     // Fetch full overview details right after provision to keep local DB fully in sync
     const overviewData = await client.getSubscriberOverview(nettvData.username).catch(error => {
@@ -4790,9 +4823,15 @@ async function reprovisionNettv(req, res, next) {
 
     await prisma.customerSubscribedService.upsert({
       where: { customerId_serviceId: { customerId, serviceId } },
-      update: { status: 'active', serviceData: finalNettvData },
-      create: { customerId, serviceId, status: 'active', serviceData: finalNettvData }
+      update: { status: 'active', externalUsername: nettvUsername, serviceData: finalNettvData },
+      create: { customerId, serviceId, status: 'active', externalUsername: nettvUsername, serviceData: finalNettvData }
     });
+
+    await prisma.$transaction([
+      prisma.customer.update({ where: { id: customerId }, data: { status: 'active', onboardStatus: 'fully_onboarded' } }),
+      prisma.customerDevice.updateMany({ where: { customerId, deviceType: 'ONT' }, data: { provisioningStatus: 'active' } }),
+      prisma.customerServiceConnection.updateMany({ where: { customerId }, data: { status: 'active', provisioningNotes: `Completed after manual NetTV provisioning on ${new Date().toISOString()}` } })
+    ]);
 
     return res.json({
       success: true,

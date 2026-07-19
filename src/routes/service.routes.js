@@ -55,6 +55,7 @@ module.exports = (prisma) => {
     router.post('/nettv/stbs', checkPermission('services_manage'), serviceController.createNetTVSTB.bind(serviceController));
     router.get('/nettv/subscribers/:username', checkPermission('services_read'), serviceController.getNetTVSubscriber.bind(serviceController));
     router.patch('/nettv/subscribers/:username', checkPermission('services_manage'), serviceController.updateNetTVSubscriber.bind(serviceController));
+    router.post('/nettv/subscribers/:username/link-customer', checkPermission('services_manage'), serviceController.linkNetTVCustomer.bind(serviceController));
     router.delete('/nettv/subscribers/:username', checkPermission('services_manage'), serviceController.deleteNetTVSubscriber.bind(serviceController));
     router.patch('/nettv/subscribers/:username/pwd', checkPermission('services_manage'), serviceController.forceNetTVPassword.bind(serviceController));
     router.get('/nettv/subscribers/:username/stbs/:serial', checkPermission('services_read'), serviceController.getNetTVSubscriberSTB.bind(serviceController));
@@ -162,12 +163,36 @@ module.exports = (prisma) => {
     router.post('/genieacs/devices/:serialNumber/factory-reset', checkPermission('services_manage'), serviceController.factoryResetGenieACSDevice.bind(serviceController));
     router.post('/genieacs/devices/:serialNumber/upgrade-firmware', checkPermission('services_manage'), serviceController.triggerGenieACSFirmwareUpgrade.bind(serviceController));
     router.post('/genieacs/devices/:serialNumber/provision', checkPermission('services_manage'), serviceController.provisionGenieACSPPPoEWiFi.bind(serviceController));
-
-
     router.post('/genieacs/devices/:serialNumber/update-wifi-all-pwd', checkPermission('services_manage'), serviceController.updateAllSSIDPassword.bind(serviceController));
-
-
     router.post('/genieacs/devices/:serialNumber/update-wifi', checkPermission('services_manage'), serviceController.updateSpecificSSID.bind(serviceController));
+
+    // ==================== GENIEACS ADMIN OPERATIONS ====================
+    router.get('/genieacs/provisions', checkPermission('services_read'), serviceController.getGenieACSProvisions.bind(serviceController));
+    router.post('/genieacs/provisions', checkPermission('services_manage'), serviceController.createOrUpdateGenieACSProvision.bind(serviceController));
+    router.delete('/genieacs/provisions/:name', checkPermission('services_manage'), serviceController.deleteGenieACSProvision.bind(serviceController));
+
+    router.get('/genieacs/virtual-parameters', checkPermission('services_read'), serviceController.getGenieACSVirtualParameters.bind(serviceController));
+    router.post('/genieacs/virtual-parameters', checkPermission('services_manage'), serviceController.createOrUpdateGenieACSVirtualParameter.bind(serviceController));
+    router.delete('/genieacs/virtual-parameters/:name', checkPermission('services_manage'), serviceController.deleteGenieACSVirtualParameter.bind(serviceController));
+
+    router.get('/genieacs/presets', checkPermission('services_read'), serviceController.getGenieACSPresets.bind(serviceController));
+    router.post('/genieacs/presets', checkPermission('services_manage'), serviceController.createOrUpdateGenieACSPreset.bind(serviceController));
+    router.delete('/genieacs/presets/:name', checkPermission('services_manage'), serviceController.deleteGenieACSPreset.bind(serviceController));
+
+    router.get('/genieacs/files', checkPermission('services_read'), serviceController.getGenieACSFiles.bind(serviceController));
+    router.post('/genieacs/files', checkPermission('services_manage'), serviceController.uploadGenieACSFile.bind(serviceController));
+    router.delete('/genieacs/files/:name', checkPermission('services_manage'), serviceController.deleteGenieACSFile.bind(serviceController));
+
+    router.get('/genieacs/config', checkPermission('services_read'), serviceController.getGenieACSConfig.bind(serviceController));
+    router.post('/genieacs/config', checkPermission('services_manage'), serviceController.updateGenieACSConfig.bind(serviceController));
+
+    router.get('/genieacs/permissions', checkPermission('services_read'), serviceController.getGenieACSPermissions.bind(serviceController));
+    router.post('/genieacs/permissions', checkPermission('services_manage'), serviceController.createGenieACSPermission.bind(serviceController));
+    router.delete('/genieacs/permissions/:id', checkPermission('services_manage'), serviceController.deleteGenieACSPermission.bind(serviceController));
+
+    router.get('/genieacs/users', checkPermission('services_read'), serviceController.getGenieACSUsers.bind(serviceController));
+    router.post('/genieacs/users', checkPermission('services_manage'), serviceController.createGenieACSUser.bind(serviceController));
+    router.delete('/genieacs/users/:id', checkPermission('services_manage'), serviceController.deleteGenieACSUser.bind(serviceController));
 
     // ==================== SMS OPERATIONS ====================
     router.get('/aakashsms/credit', checkPermission('services_read'), serviceController.getSmsCredit.bind(serviceController));
@@ -179,7 +204,6 @@ module.exports = (prisma) => {
     router.get('/sms/campaigns', checkPermission('services_read'), serviceController.getSmsCampaigns.bind(serviceController));
     router.get('/sms/campaigns/:id/logs', checkPermission('services_read'), serviceController.getSmsCampaignLogs.bind(serviceController));
     router.get('/sms/campaigns/:id/export', checkPermission('services_read'), serviceController.exportSmsCampaignLogs.bind(serviceController));
-
     // ==================== HEALTH CHECK ====================
     router.get('/health', (req, res) => {
         res.json({

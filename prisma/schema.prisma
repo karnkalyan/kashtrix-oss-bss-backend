@@ -119,6 +119,15 @@ model ISP {
   asteriskTrunks       AsteriskTrunk[]
   asteriskActiveCalls  AsteriskActiveCall[]
   asteriskSystemStatus AsteriskSystemStatus[]
+  asteriskAiAgents           AsteriskAiAgent[]
+  asteriskAiAgentPromptVersions AsteriskAiAgentPromptVersion[]
+  asteriskInboundRoutes      AsteriskInboundRoute[]
+  asteriskOutboundRoutes     AsteriskOutboundRoute[]
+  asteriskQueues             AsteriskQueue[]
+  asteriskRingGroups         AsteriskRingGroup[]
+  asteriskIvrs               AsteriskIvr[]
+  asteriskRecordings         AsteriskRecording[]
+  asteriskProvisioningConfig AsteriskProvisioningConfig?
   branches             Branch[]
   departments          Department[]
   users                User[]
@@ -621,10 +630,12 @@ model CustomerSubscribedService {
   status      String    @default("active")
   validUntil  DateTime?
   serviceData Json?
+  externalUsername String? @db.VarChar(191)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
   @@unique([customerId, serviceId])
+  @@index([serviceId, externalUsername])
 }
 
 model CustomerDocument {
@@ -3107,6 +3118,7 @@ model ManagedDeviceCredential {
   encryptionVersion    Int      @default(1)
   credentialKinds      Json?
   lastRotatedAt        DateTime?
+  requiresRotation     Boolean  @default(false)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
   device               ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
@@ -3263,4 +3275,251 @@ model ManagedDeviceConfigurationTask {
   @@index([deviceId, createdAt])
   @@index([ispId, status])
   @@map("managed_device_configuration_tasks")
+}
+
+// ==================== UPGRADED ASTERISK MODELS ====================
+model AsteriskAiAgent {
+  id              Int       @id @default(autoincrement())
+  ispId           Int
+  extension       String
+  name            String
+  description     String?   @db.Text
+  provider        String    @default("gemini_live")
+  model           String
+  voice           String
+  languageMode    String    @default("automatic")
+  prompt          String    @db.Text
+  promptVersion   Int       @default(1)
+  audioSocketHost String    @default("127.0.0.1")
+  audioSocketPort Int
+  serviceName     String
+  enabled         Boolean   @default(true)
+  runtimeStatus   String    @default("stopped")
+  dialplanStatus  String    @default("configured")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Upgraded Fields from 5. AI-AGENT DATA MODEL
+  extensionNumber       String?
+  agentName             String?
+  systemPrompt          String?   @db.Text
+  runtimeType           String?   @default("python")
+  runtimePath           String?
+  promptFilePath        String?
+  virtualEnvPath        String?
+  systemdServiceName    String?
+  dialplanContext       String?   @default("internal")
+  dialplanFile          String?   @db.Text
+  autoStart             Boolean   @default(true)
+  managedByProvisioning Boolean   @default(true)
+
+  isp             ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_isp_fkey")
+
+  @@unique([ispId, extension])
+  @@map("asterisk_ai_agents")
+}
+
+model AsteriskAiAgentPromptVersion {
+  id            Int      @id @default(autoincrement())
+  ispId         Int
+  agentId       Int
+  version       Int
+  prompt        String   @db.Text
+  changedBy     String?
+  createdAt     DateTime @default(now())
+
+  isp             ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_prompt_version_isp_fkey")
+
+  @@unique([ispId, agentId, version])
+  @@map("asterisk_ai_agent_prompt_versions")
+}
+
+model AsteriskInboundRoute {
+  id                 Int      @id @default(autoincrement())
+  ispId              Int
+  routeName          String
+  trunkId            String?
+  didPattern         String?
+  callerIdPattern    String?
+  timeCondition      String?
+  primaryDestination String
+  destinationType    String
+  failoverDestination String?
+  enabled            Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  isp                ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_inbound_route_isp_fkey")
+
+  @@map("asterisk_inbound_routes")
+}
+
+model AsteriskOutboundRoute {
+  id              Int      @id @default(autoincrement())
+  ispId           Int
+  routeName       String
+  dialPattern     String
+  prefix          String?
+  prepend         String?
+  trunkOrder      Json
+  fallbackTrunks  Json?
+  callerId        String?
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  isp             ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_outbound_route_isp_fkey")
+
+  @@map("asterisk_outbound_routes")
+}
+
+model AsteriskQueue {
+  id                  Int      @id @default(autoincrement())
+  ispId               Int
+  name                String
+  number              String
+  members             Json
+  strategy            String   @default("ringall")
+  timeout             Int      @default(15)
+  retry               Int      @default(5)
+  maxCallers          Int      @default(0)
+  musicOnHold         String   @default("default")
+  failoverDestination String?
+  enabled             Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  isp                 ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_queue_isp_fkey")
+
+  @@unique([ispId, number])
+  @@map("asterisk_queues")
+}
+
+model AsteriskRingGroup {
+  id                  Int      @id @default(autoincrement())
+  ispId               Int
+  name                String
+  number              String
+  members             Json
+  ringStrategy        String   @default("ringall")
+  ringTime            Int      @default(20)
+  failoverDestination String?
+  enabled             Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  isp                 ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ring_group_isp_fkey")
+
+  @@unique([ispId, number])
+  @@map("asterisk_ring_groups")
+}
+
+model AsteriskIvr {
+  id                 Int      @id @default(autoincrement())
+  ispId              Int
+  name               String
+  extension          String
+  greeting           String
+  timeout            Int      @default(10)
+  invalidDestination String?
+  timeoutDestination String?
+  menuMappings       Json
+  enabled            Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  isp                ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ivr_isp_fkey")
+
+  @@unique([ispId, extension])
+  @@map("asterisk_ivrs")
+}
+
+model AsteriskRecording {
+  id            Int      @id @default(autoincrement())
+  ispId         Int
+  fileName      String
+  filePath      String
+  callId        String?
+  duration      Int?
+  fileSize      Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  isp           ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_recording_isp_fkey")
+
+  @@map("asterisk_recordings")
+}
+
+model AsteriskProvisioningConfig {
+  id                     Int       @id @default(autoincrement())
+  ispId                  Int       @unique
+  enabled                Boolean   @default(true)
+  pbxHost                String?   @default("10.3.2.16")
+  sipPort                Int?      @default(5060)
+  ariEnabled             Boolean   @default(true)
+  ariHost                String?   @default("10.3.2.16")
+  ariPort                Int?      @default(8088)
+  ariAppName             String?   @default("kisan")
+  ariUsername            String?   @default("kashtrix-api")
+  ariPassword            String?   @db.Text
+  amiEnabled             Boolean   @default(true)
+  amiHost                String?   @default("10.3.2.16")
+  amiPort                Int?      @default(5038)
+  amiUsername            String?   @default("kashtrix-ami")
+  amiPassword            String?   @db.Text
+  provisioningEnabled    Boolean   @default(true)
+  provisioningMode       String    @default("local")
+  provisioningHost       String?   @default("10.3.2.16")
+  provisioningPort       Int?      @default(22)
+  provisioningUsername   String?   @default("kashtrix-api")
+  sshPrivateKey          String?   @db.Text
+  asteriskConfigDirectory String?  @default("/etc/asterisk")
+  asteriskCliPath        String?   @default("/usr/sbin/asterisk")
+  asteriskSystemdService String?   @default("asterisk")
+  customDialplanFile     String?   @default("/etc/asterisk/extensions_custom.conf")
+  audioSocketBindHost    String?   @default("127.0.0.1")
+  cdrSourceType          String?   @default("internal_cache")
+  cdrConnectionSettings  String?   @db.Text
+  lastHealthStatus       String?   @db.Text
+  lastSuccessfulSync     DateTime?
+  lastError              String?   @db.Text
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  // Compatibility fields
+  mode                   String    @default("local")
+  host                   String?
+  port                   Int?      @default(22)
+  username               String?
+  credentialReference    String?
+  pjsipConfigPath        String?
+  dialplanConfigPath     String?
+  managedDialplanContext String?   @default("internal")
+  lastTestedAt           DateTime?
+  configFiles            Json?
+  sshHost                String?
+  sshPort                Int?      @default(22)
+  sshUsername            String?
+  sshPassword            String?
+  localConfigDir         String?
+
+  isp                    ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_provisioning_config_isp_fkey")
+
+  @@map("asterisk_provisioning_configs")
+}
+
+model AsteriskToolAssignment {
+  id            Int      @id @default(autoincrement())
+  ispId         Int
+  agentId       Int
+  toolName      String
+  riskLevel     String   @default("read")
+  requiresConfirmation Boolean @default(false)
+  requiredPermission String?
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([ispId, agentId, toolName])
+  @@map("asterisk_tool_assignments")
 }

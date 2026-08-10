@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   api:
     build:
@@ -21,11 +19,12 @@ services:
       - /etc/kashtrix/secrets/backend.env
 
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:172.20.0.1"
 
     networks:
       - app-network
 
 networks:
   app-network:
-    driver: bridge
+    external: true
+    name: kashtrix_backend_net

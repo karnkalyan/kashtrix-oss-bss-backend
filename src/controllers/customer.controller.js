@@ -10,24 +10,32 @@ const { SERVICE_CODES } = require('../lib/serviceConstants');  // <-- add this l
 const { formatRadiusExpiration } = require('../utils/radiusExpiration');
 const getDriver = require('../drivers');
 const { syncOrderToAccounting } = require('../services/accountingInvoice.service');
+const { rechargeCustomerNetTV } = require('../services/nettv-recharge.service');
+const { extractOltRxPower } = require('../utils/opticalPower');
 
 function getSubscriptionRenewalBase(subscription, now = new Date()) {
+  if (!subscription) return now;
   const planEnd = subscription?.planEnd ? new Date(subscription.planEnd) : now;
   const deductibleDays = Math.max(0, Number(subscription?.graceDaysBalance || 0)) + Math.max(0, Number(subscription?.adminExtensionDays || 0));
+  const originalExpiry = new Date(planEnd);
+  originalExpiry.setDate(originalExpiry.getDate() - deductibleDays);
+  originalExpiry.setHours(0, 0, 0, 0);
   if (deductibleDays > 0) {
-    const originalExpiry = new Date(planEnd);
-    originalExpiry.setDate(originalExpiry.getDate() - deductibleDays);
     return originalExpiry;
   }
-  return planEnd >= now ? planEnd : now;
+  const result = planEnd >= now ? planEnd : now;
+  result.setHours(0, 0, 0, 0);
+  return result;
 }
 
 async function getSubscriptionRenewalWindow(prisma, ispId, subscription) {
   const now = new Date();
-  if (!subscription?.isTrial) return { planStart: getSubscriptionRenewalBase(subscription, now), trialDeductionDays: 0 };
+  if (!subscription) return { planStart: now, trialDeductionDays: 0 };
+  const baseStart = getSubscriptionRenewalBase(subscription, now);
+  if (!subscription.isTrial) return { planStart: baseStart, trialDeductionDays: 0 };
   const setting = await prisma.iSPSettings.findFirst({ where: { ispId: Number(ispId), key: 'trialDeductionOnSubscriptionActivation' } });
   const trialMs = Math.max(0, new Date(subscription.planEnd) - new Date(subscription.planStart));
-  return { planStart: now, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
+  return { planStart: baseStart, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
 }
 // ----------------------------------------------------------------------
 // Multer configuration
@@ -617,7 +625,7 @@ async function generateCustomerUniqueId(tx, customerId, firstName = '', lastName
   let settingsObj = {};
   if (ispId) {
     try {
-      const settings = await tx.ISPSettings.findMany({
+      const settings = await tx.iSPSettings.findMany({
         where: { ispId }
       });
       settingsObj = settings.reduce((acc, s) => {
@@ -886,7 +894,12 @@ async function createCustomer(req, res, next) {
 
     // Fetch lead
     const lead = await prisma.lead.findFirst({
-      where: { id: Number(leadId), isDeleted: false, ispId: req.ispId },
+      where: {
+        id: Number(leadId),
+        isDeleted: false,
+        ispId: req.ispId,
+        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+      },
     });
     if (!lead) return res.status(404).json({ success: false, error: 'Lead not found' });
     if (lead.convertedToCustomer) return res.status(409).json({ success: false, error: 'Lead already converted' });
@@ -896,6 +909,7 @@ async function createCustomer(req, res, next) {
 
     const effectiveBranchId = branchId || lead.branchId;
     const effectiveSubBranchId = subBranchId || lead.subBranchId;
+    const effectiveResellerId = req.user?.resellerId ? Number(req.user.resellerId) : (lead.resellerId ? Number(lead.resellerId) : null);
 
     const requirementRows = await prisma.iSPSettings.findMany({
       where: { ispId: req.ispId, key: { in: ['customerDocumentsRequired', 'customerDeviceRequired', 'fiberOnuRequired'] } }
@@ -972,6 +986,18 @@ async function createCustomer(req, res, next) {
     if (!subscribedPackage) {
       return res.status(400).json({ success: false, error: 'Invalid subscribed package selected' });
     }
+    if (req.user?.resellerId) {
+      const planAssignment = await prisma.packagePlanReseller.findFirst({
+        where: {
+          packagePlanId: Number(subscribedPackage.planId),
+          resellerId: Number(req.user.resellerId)
+        },
+        select: { id: true }
+      });
+      if (!planAssignment) {
+        return res.status(403).json({ success: false, error: 'This package is not assigned to your reseller account' });
+      }
+    }
 
     const requestedLoginUsername = normalizeCustomerLoginUsername(customerLoginUsername);
     if (requestedLoginUsername) {
@@ -1020,6 +1046,7 @@ async function createCustomer(req, res, next) {
           ...(effectiveSubBranchId && { subBranch: { connect: { id: Number(effectiveSubBranchId) } } }),
           ...(targetTypeId && { customerType: { connect: { id: targetTypeId } } }),
           ...(req.ispId && { isp: { connect: { id: Number(req.ispId) } } }),
+          ...(effectiveResellerId && { reseller: { connect: { id: effectiveResellerId } } }),
           ...(installedById && { installedBy: { connect: { id: Number(installedById) } } }),
           ...(existingISPId && { existingISP: { connect: { id: Number(existingISPId) } } }),
           packagePrice: { connect: { id: subscribedPackage.id } },
@@ -1074,6 +1101,7 @@ async function createCustomer(req, res, next) {
               status: 'active',
               ispId: req.ispId ? Number(req.ispId) : null,
               branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+              resellerId: effectiveResellerId,
               customerId: createdCustomer.id,
             },
           });
@@ -2165,7 +2193,8 @@ async function listCustomers(req, res, next) {
     const where = { 
       isDeleted: false, 
       ispId: req.ispId,
-      ...(branchFilter || {})
+      ...(branchFilter || {}),
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
     if (status) where.status = status;
     if (onboardStatus) where.onboardStatus = onboardStatus;
@@ -2417,15 +2446,31 @@ async function getCustomerById(req, res, next) {
     // Fetch realtime ONT and Radius statuses
     const realtimeNet = await getRealtimeNetworkStatus(req.prisma, customer);
 
-    // Let's enrich tr069Devices in response with realtime status if available
+    // Enrich assigned hardware with both CPE and OLT-side optical readings.
+    const deviceSerials = [...new Set((customer.devices || []).flatMap(device => [device.serialNumber, device.ponSerial]).filter(Boolean))];
+    const linkedOnts = deviceSerials.length ? await req.prisma.oNT.findMany({
+      where: { ispId: req.ispId, isDeleted: false, serialNumber: { in: deviceSerials } },
+      include: { olt: { select: { id: true, name: true, vendor: true } }, ontDetails: { select: { opticalDiagnostics: true } } }
+    }) : [];
+    const ontBySerial = new Map(linkedOnts.map(ont => [String(ont.serialNumber).toUpperCase(), ont]));
     const enrichedDevices = (customer.devices || []).map(d => {
+      const linkedOnt = ontBySerial.get(String(d.ponSerial || d.serialNumber || '').toUpperCase());
+      const optics = linkedOnt ? {
+        ontRxPower: linkedOnt.rxPower,
+        oltRxPower: extractOltRxPower(linkedOnt),
+        oltName: linkedOnt.olt?.name || null,
+        oltVendor: linkedOnt.olt?.vendor || null,
+        servicePort: linkedOnt.servicePort,
+        lastSync: linkedOnt.lastSync
+      } : {};
       if (d.serialNumber && realtimeNet.ontRealtimeStatus !== 'N/A') {
         return {
           ...d,
-          status: realtimeNet.ontRealtimeStatus
+          status: realtimeNet.ontRealtimeStatus,
+          ...optics
         };
       }
-      return d;
+      return { ...d, ...optics };
     });
 
     // Flatten lead fields
@@ -2491,7 +2536,8 @@ async function getCustomerByPhoneNumber(req, res, next) {
           ]
         },
         isDeleted: false,
-        ispId: req.ispId
+        ispId: req.ispId,
+        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
       },
       include: {
         lead: true,
@@ -3230,6 +3276,14 @@ const subscribePackage = async (req, res, next) => {
       console.error('[CUSTOMER RECHARGE ACCOUNTING] Sales invoice sync failed:', accountingError.message);
     }
 
+    const nettvRecharge = await rechargeCustomerNetTV({
+      prisma: req.prisma,
+      ispId: req.ispId,
+      customerId: customer.id,
+      packageId: pkg.id,
+      orderId: createdOrder.id
+    }).catch(error => ({ required: true, status: 'FAILED', message: `Internet package renewed, but NetTV recharge failed: ${error.message}` }));
+
     await logAudit(req.prisma, req.user?.id, 'CUSTOMER_PACKAGE_RENEW', { id: customer.id, packageId: pkg.id, packageName: pkg.packageName, totalAmount }, req);
 
     return res.status(201).json({
@@ -3242,7 +3296,8 @@ const subscribePackage = async (req, res, next) => {
         packageEnd: createdOrder.packageEnd,
         totalAmount: createdOrder.totalAmount,
         items: createdOrder.items
-      }
+      },
+      nettvRecharge
     });
   } catch (err) {
     console.error("subscribePackage error:", err);
@@ -3969,11 +4024,16 @@ async function createOwnReferral(req, res, next) {
 async function getCustomerStatusSummary(req, res, next) {
   try {
     const ispId = req.ispId;
+    const scope = {
+      ispId,
+      isDeleted: false,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+    };
     const [total, draft, active, inactive] = await Promise.all([
-      req.prisma.customer.count({ where: { ispId, isDeleted: false } }),
-      req.prisma.customer.count({ where: { ispId, status: 'draft', isDeleted: false } }),
-      req.prisma.customer.count({ where: { ispId, status: 'active', isDeleted: false } }),
-      req.prisma.customer.count({ where: { ispId, status: 'inactive', isDeleted: false } })
+      req.prisma.customer.count({ where: scope }),
+      req.prisma.customer.count({ where: { ...scope, status: 'draft' } }),
+      req.prisma.customer.count({ where: { ...scope, status: 'active' } }),
+      req.prisma.customer.count({ where: { ...scope, status: 'inactive' } })
     ]);
 
     return res.json({
@@ -4718,14 +4778,6 @@ async function syncNettv(req, res, next) {
     
     // Store in local DB
     const localStatus = overviewData?.subscriber?.status === 1 ? 'active' : 'inactive';
-    
-    // Sync customer status
-    if (overviewData?.subscriber?.status === 0 || overviewData?.subscriber?.status === 1) {
-      await prisma.customer.update({
-        where: { id: customer.id },
-        data: { status: localStatus }
-      });
-    }
 
     const updatedSubscribedService = await prisma.customerSubscribedService.upsert({
       where: { customerId_serviceId: { customerId, serviceId } },

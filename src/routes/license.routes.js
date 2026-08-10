@@ -52,6 +52,7 @@ module.exports = (prisma) => {
         select: {
           isp: {
             select: {
+              id: true,
               companyName: true,
               contactPerson: true,
               phoneNumber: true,
@@ -73,20 +74,17 @@ module.exports = (prisma) => {
 
   async function getPublicIsp(status) {
     const installedIspId = status?.dbLicense?.installedIspId || Number(process.env.DEFAULT_ISP_ID || 1);
-    const isp = await prisma.iSP.findFirst({
-      where: {
-        ...(installedIspId ? { id: Number(installedIspId) } : {}),
-        isDeleted: false
-      },
-      select: {
-        companyName: true
-      }
-    });
+    const normalizedIspId = Number(installedIspId);
+    const isp = Number.isFinite(normalizedIspId) && normalizedIspId > 0
+      ? await prisma.iSP.findUnique({
+          where: { id: normalizedIspId },
+          select: { companyName: true }
+        })
+      : null;
 
     if (isp) return isp;
 
     return prisma.iSP.findFirst({
-      where: { isDeleted: false },
       orderBy: { id: 'asc' },
       select: { companyName: true }
     });
@@ -94,8 +92,9 @@ module.exports = (prisma) => {
 
   router.get('/status', async (req, res, next) => {
     try {
-      const status = await getStatus(prisma);
       const isp = await getRequestIsp(req);
+      const ispId = isp?.id || Number(process.env.DEFAULT_ISP_ID || 1);
+      const status = await getStatus(prisma, ispId);
       const publicIsp = isp || await getPublicIsp(status);
       res.json({ ...status, isp, publicIsp });
     } catch (error) {
@@ -103,8 +102,12 @@ module.exports = (prisma) => {
     }
   });
 
-  router.get('/hwid', async (req, res) => {
-    res.json({ hwid: await getHardwareFingerprint(prisma) });
+  router.get('/hwid', auth, async (req, res) => {
+    const requestedIspId = Number(req.query?.ispId || req.ispId);
+    if (requestedIspId !== req.ispId && !isSystemAdmin(req)) return res.status(403).json({ error: 'Provider access is restricted.' });
+    const tenant = await prisma.iSP.findUnique({ where: { id: requestedIspId }, select: { id: true } });
+    if (!tenant) return res.status(404).json({ error: 'ISP tenant not found.' });
+    res.json({ hwid: await getHardwareFingerprint(prisma, requestedIspId), ispId: requestedIspId });
   });
 
   router.post('/install', auth, async (req, res, next) => {
@@ -113,7 +116,7 @@ module.exports = (prisma) => {
       const token = String(req.body?.token || '').trim();
       if (!token) return res.status(400).json({ error: 'License token is required' });
       await saveToken(prisma, req.ispId, token);
-      res.json(await getStatus(prisma));
+      res.json(await getStatus(prisma, req.ispId));
     } catch (error) {
       next(error);
     }
@@ -122,8 +125,8 @@ module.exports = (prisma) => {
   router.delete('/', auth, async (req, res, next) => {
     try {
       if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can delete license.' });
-      await deleteToken(prisma);
-      res.json(await getStatus(prisma));
+      await deleteToken(prisma, req.ispId);
+      res.json(await getStatus(prisma, req.ispId));
     } catch (error) {
       next(error);
     }
@@ -133,7 +136,7 @@ module.exports = (prisma) => {
     try {
       if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can generate license.' });
       if (!hasGeneratorAccess(req)) return res.status(403).json({ error: 'License generator access has expired. Please enter the access secret again.' });
-      res.json(await generateLicense(prisma, req.body || {}, req.user));
+      res.json(await generateLicense(prisma, { ...(req.body || {}), ispId: req.body?.ispId || req.ispId }, req.user));
     } catch (error) {
       next(error);
     }
@@ -188,7 +191,7 @@ module.exports = (prisma) => {
       if (!hasGeneratorAccess(req)) return res.status(403).json({ error: 'License generator access has expired. Please enter the access secret again.' });
       const { token } = await getGeneratedLicenseToken(prisma, req.params.id);
       await saveToken(prisma, req.ispId, token);
-      res.json(await getStatus(prisma));
+      res.json(await getStatus(prisma, req.ispId));
     } catch (error) {
       next(error);
     }

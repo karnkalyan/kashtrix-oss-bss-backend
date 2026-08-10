@@ -40,6 +40,7 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
 
   if (!durationString && durationString !== 0) {
     date.setMonth(date.getMonth() + 1);
+    date.setHours(0, 0, 0, 0);
     return date;
   }
 
@@ -52,9 +53,11 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
   if (isoMatch) {
     const v = parseInt(isoMatch[1], 10);
     const u = isoMatch[2].toLowerCase();
-    if (u === 'd') { date.setDate(date.getDate() + v); return date; }
-    if (u === 'm') { date.setMonth(date.getMonth() + v); return date; }
-    if (u === 'y') { date.setFullYear(date.getFullYear() + v); return date; }
+    if (u === 'd') { date.setDate(date.getDate() + v); }
+    else if (u === 'm') { date.setMonth(date.getMonth() + v); }
+    else if (u === 'y') { date.setFullYear(date.getFullYear() + v); }
+    date.setHours(0, 0, 0, 0);
+    return date;
   }
 
   const re = /(\d+)\s*(?:-?\s*)?(d(?:ays?)?|day|m(?:o(?:nths?)?)?|mo|month(?:s)?|months?|y(?:ears?|r)?|yr|year(?:s)?)/i;
@@ -64,9 +67,10 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
     const anyNum = s.match(/(\d+)/);
     if (anyNum) {
       date.setMonth(date.getMonth() + parseInt(anyNum[1], 10));
-      return date;
+    } else {
+      date.setMonth(date.getMonth() + 1);
     }
-    date.setMonth(date.getMonth() + 1);
+    date.setHours(0, 0, 0, 0);
     return date;
   }
 
@@ -81,6 +85,7 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
   else if (unit === 'month') date.setMonth(date.getMonth() + value);
   else if (unit === 'year') date.setFullYear(date.getFullYear() + value);
 
+  date.setHours(0, 0, 0, 0);
   return date;
 }
 

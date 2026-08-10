@@ -1,5 +1,29 @@
 const axios = require('axios');
 const { SERVICE_CODES } = require('../lib/serviceConstants');
+const { flattenParameters } = require('./tr069-wan-adapter.service');
+
+const DIAGNOSTIC_DEFINITIONS = {
+    'TR-181': {
+        ping: { root: 'Device.IP.Diagnostics.IPPing', host: 'Host', count: 'NumberOfRepetitions', timeout: 'Timeout', interface: 'Interface' },
+        traceroute: { root: 'Device.IP.Diagnostics.TraceRoute', host: 'Host', count: 'NumberOfTries', timeout: 'Timeout', interface: 'Interface' },
+        dns: {
+            root: 'Device.DNS.Diagnostics.NSLookupDiagnostics',
+            host: 'HostName',
+            count: 'NumberOfRepetitions',
+            timeout: 'Timeout'
+        }
+    },
+    'TR-098': {
+        ping: { root: 'InternetGatewayDevice.IPPingDiagnostics', host: 'Host', count: 'NumberOfRepetitions', timeout: 'Timeout', interface: 'Interface' },
+        traceroute: { root: 'InternetGatewayDevice.TraceRouteDiagnostics', host: 'Host', count: 'NumberOfTries', timeout: 'Timeout', interface: 'Interface' },
+        dns: {
+            root: 'InternetGatewayDevice.NSLookupDiagnostics',
+            host: 'HostName',
+            count: 'NumberOfRepetitions',
+            timeout: 'Timeout'
+        }
+    }
+};
 
 class GenieACSClient {
     constructor(config) {
@@ -11,6 +35,7 @@ class GenieACSClient {
         this.baseURL = config.baseUrl;
         this.username = config.username;
         this.password = config.password;
+        this.diagnosticRefreshAt = new Map();
 
         // Create axios instance
         const axiosConfig = {
@@ -261,7 +286,7 @@ class GenieACSClient {
      */
     async getDeviceBySerial(serialNumber, options = {}) {
         try {
-            const { projection } = options;
+            const { projection, full = false, requestTimeoutMs } = options;
 
             // Default projection if none provided
             const defaultProjection = `
@@ -286,13 +311,19 @@ class GenieACSClient {
                 "_deviceId._SerialNumber": serialNumber
             };
 
-            const response = await this.client.get('/devices', {
-                params: {
-                    query: JSON.stringify(query),
-                    limit: 1,
-                    projection: projection || defaultProjection.replace(/\s+/g, '') // Remove whitespace
-                }
-            });
+            const params = {
+                query: JSON.stringify(query),
+                limit: 1
+            };
+            if (!full) {
+                params.projection = String(projection || defaultProjection).replace(/\s+/g, '');
+            }
+
+            const requestConfig = { params };
+            if (Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+                requestConfig.timeout = requestTimeoutMs;
+            }
+            const response = await this.client.get('/devices', requestConfig);
 
             if (!response.data || response.data.length === 0) {
                 throw new Error(`Device with serial ${serialNumber} not found`);
@@ -301,7 +332,7 @@ class GenieACSClient {
             const device = response.data[0];
 
             // If this is a simple request (no projection parameter or specific flag), return essential info
-            if (!projection) {
+            if (!projection && !full) {
                 return {
                     id: device._id,
                     serial: device._deviceId?._SerialNumber,
@@ -393,9 +424,17 @@ class GenieACSClient {
     /**
      * Create task on device
      */
-    async createTask(serialNumber, task) {
+    async createTask(serialNumber, task, options = {}) {
         try {
-            const device = await this.getDeviceBySerial(serialNumber);
+            const requestTimeoutMs = Number(options.requestTimeoutMs);
+            const connectionRequestTimeoutMs = Number(options.connectionRequestTimeoutMs);
+            const hasRequestTimeout = Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0;
+            const connectionRequestTimeout = Number.isFinite(connectionRequestTimeoutMs) && connectionRequestTimeoutMs > 0
+                ? Math.floor(connectionRequestTimeoutMs)
+                : 3000;
+            const device = await this.getDeviceBySerial(serialNumber, {
+                ...(hasRequestTimeout ? { requestTimeoutMs } : {})
+            });
 
             // DEBUG: Check what device data is actually returning
             // console.log("DEBUG: Found Device Object:", device);
@@ -406,29 +445,18 @@ class GenieACSClient {
 
             // IMPORTANT: Ensure deviceId is URL encoded
             const deviceId = encodeURIComponent(device.id);
-            console.log("Task", task);
-
-            console.log("Device ID", deviceId);
             // Try the standard tasks endpoint
-            const response = await this.client.post(`/devices/${deviceId}/tasks?timeout=3000&connection_request=true`, task);
-
-            console.log("Response Status", response.status);
-            console.log("Response Status Text", response.statusText);
-            if (response.status !== 202) {
-                return {
-                    status: "success",
-                    taskId: response.data._id,
-                    message: "Task created successfully",
-                    timestamp: new Date().toISOString()
-                };
-            } else {
-                return {
-                    status: "error",
-                    taskId: response.data._id,
-                    message: "Task faulted",
-                    timestamp: new Date().toISOString()
-                };
-            }
+            const response = await this.client.post(
+                `/devices/${deviceId}/tasks?timeout=${connectionRequestTimeout}&connection_request=true`,
+                task,
+                hasRequestTimeout ? { timeout: requestTimeoutMs } : undefined
+            );
+            return {
+                status: response.status === 202 ? "queued" : "completed",
+                taskId: response.data?._id || null,
+                message: response.status === 202 ? "Task queued successfully" : "Task completed successfully",
+                timestamp: new Date().toISOString()
+            };
 
 
             // return {
@@ -471,12 +499,12 @@ class GenieACSClient {
     }
 
     // Task methods
-    async refreshObject(serialNumber, objectName) {
+    async refreshObject(serialNumber, objectName, options = {}) {
         const task = {
             name: "refreshObject",
             objectName: objectName
         };
-        return this.createTask(serialNumber, task);
+        return this.createTask(serialNumber, task, options);
     }
 
     // Create a new WANConnectionDevice (dynamic)
@@ -998,13 +1026,175 @@ class GenieACSClient {
         return this.createTask(serialNumber, task);
     }
 
+    async getDeviceParameterSnapshot(serialNumber, { refresh = false } = {}) {
+        let device = await this.getDeviceBySerial(serialNumber, { full: true });
+        const refreshTasks = [];
+
+        if (refresh) {
+            const roots = [
+                device?.InternetGatewayDevice ? 'InternetGatewayDevice' : null,
+                device?.Device ? 'Device' : null,
+                device?.VirtualParameters ? 'VirtualParameters' : null
+            ].filter(Boolean);
+
+            for (const objectName of roots) {
+                try {
+                    const task = await this.refreshObject(serialNumber, objectName);
+                    refreshTasks.push({ objectName, ...task });
+                } catch (error) {
+                    refreshTasks.push({ objectName, status: 'failed', message: error.message });
+                }
+            }
+            device = await this.getDeviceBySerial(serialNumber, { full: true });
+        }
+
+        return { device, refreshTasks };
+    }
+
+    async runDiagnostic(serialNumber, { type, target, repetitions = 4, timeout = 5000, interfacePath = '' }) {
+        const device = await this.getDeviceBySerial(serialNumber, {
+            projection: '_id,Device.IP.Diagnostics,Device.DNS.Diagnostics,InternetGatewayDevice.IPPingDiagnostics,InternetGatewayDevice.TraceRouteDiagnostics,InternetGatewayDevice.NSLookupDiagnostics'
+        });
+        const tr181 = Boolean(device?.Device);
+        const dataModel = tr181 ? 'TR-181' : 'TR-098';
+        const definition = DIAGNOSTIC_DEFINITIONS[dataModel][type];
+        if (!definition) throw new Error(`Unsupported diagnostic type: ${type}`);
+        const parameterValues = [
+            [`${definition.root}.${definition.host}`, target, 'xsd:string']
+        ];
+        if (definition.interface && interfacePath) {
+            parameterValues.push([`${definition.root}.${definition.interface}`, interfacePath, 'xsd:string']);
+        }
+        if (definition.count) {
+            parameterValues.push([`${definition.root}.${definition.count}`, String(repetitions), 'xsd:unsignedInt']);
+        }
+        if (definition.timeout) {
+            parameterValues.push([`${definition.root}.${definition.timeout}`, String(timeout), 'xsd:unsignedInt']);
+        }
+        parameterValues.push([`${definition.root}.DiagnosticsState`, 'Requested', 'xsd:string']);
+        const task = await this.createTask(serialNumber, { name: 'setParameterValues', parameterValues });
+        return { ...task, diagnostic: type, target, dataModel, resultPath: definition.root, resultStatus: 'pending' };
+    }
+
+    async getDiagnosticResult(serialNumber, { type, dataModel, refresh = false, taskId = '' }) {
+        const normalizedType = String(type || '').toLowerCase();
+        const normalizedModel = String(dataModel || '').toUpperCase() === 'TR-181' ? 'TR-181' : 'TR-098';
+        const definition = DIAGNOSTIC_DEFINITIONS[normalizedModel]?.[normalizedType];
+        if (!definition) throw new Error(`Unsupported diagnostic type: ${type}`);
+
+        let queuedTask = null;
+        if (taskId) {
+            queuedTask = await this.getTask(taskId).catch(() => null);
+        }
+
+        let refreshError = null;
+        let refreshTask = null;
+        const refreshKey = `${serialNumber}:${normalizedModel}:${normalizedType}`;
+        const lastRefreshAt = this.diagnosticRefreshAt?.get(refreshKey) || 0;
+        const refreshDue = Date.now() - lastRefreshAt >= 60000;
+        if (refresh && !queuedTask && refreshDue) {
+            try {
+                if (!this.diagnosticRefreshAt) this.diagnosticRefreshAt = new Map();
+                this.diagnosticRefreshAt.set(refreshKey, Date.now());
+                refreshTask = await this.refreshObject(serialNumber, definition.root);
+            } catch (error) {
+                refreshError = error.message;
+            }
+        }
+
+        const device = await this.getDeviceBySerial(serialNumber, {
+            projection: `_id,${definition.root}`
+        });
+        const flattened = flattenParameters(device);
+        const prefix = `${definition.root}.`;
+        const parameters = Object.fromEntries(
+            Object.entries(flattened)
+                .filter(([path]) => path.startsWith(prefix))
+                .map(([path, value]) => [path.slice(prefix.length), value])
+        );
+        const diagnosticsState = String(parameters.DiagnosticsState || 'Unknown');
+        const lowerState = diagnosticsState.toLowerCase();
+        const diagnosticStatus = lowerState === 'complete'
+            ? 'completed'
+            : lowerState.startsWith('error')
+                ? 'failed'
+                : ['requested', 'none', 'unknown', ''].includes(lowerState)
+                    ? 'pending'
+                    : 'pending';
+        const status = queuedTask ? 'queued' : diagnosticStatus;
+
+        const groupedResults = new Map();
+        for (const [path, value] of Object.entries(parameters)) {
+            const match = path.match(/^(?:Result|Results|RouteHops?|Hop)\.(\d+)\.(.+)$/i);
+            if (!match) continue;
+            const [, index, field] = match;
+            if (!groupedResults.has(index)) groupedResults.set(index, { index: Number(index) });
+            groupedResults.get(index)[field] = value;
+        }
+
+        const valueFor = (...names) => {
+            for (const name of names) {
+                if (Object.prototype.hasOwnProperty.call(parameters, name)) return parameters[name];
+                const key = Object.keys(parameters).find(path => path.endsWith(`.${name}`));
+                if (key) return parameters[key];
+            }
+            return null;
+        };
+
+        const responseTimeFor = (detailedName, coarseName) => {
+            const detailed = Number(valueFor(detailedName));
+            if (Number.isFinite(detailed) && detailed > 0) return Number((detailed / 1000).toFixed(3));
+            return valueFor(coarseName);
+        };
+
+        return {
+            diagnostic: normalizedType,
+            dataModel: normalizedModel,
+            resultPath: definition.root,
+            status,
+            taskStatus: queuedTask ? 'queued' : 'consumed',
+            message: queuedTask
+                ? 'GenieACS has queued the task, but the CPE has not consumed it yet.'
+                : diagnosticStatus === 'pending'
+                    ? 'The CPE consumed the task and the diagnostic is still running or awaiting refreshed results.'
+                    : null,
+            queuedAt: queuedTask?.timestamp || null,
+            diagnosticsState,
+            target: valueFor(definition.host),
+            summary: {
+                successCount: valueFor('SuccessCount'),
+                failureCount: valueFor('FailureCount'),
+                resultCount: valueFor('ResultNumberOfEntries', 'RouteHopsNumberOfEntries'),
+                minimumResponseTime: responseTimeFor('MinimumResponseTimeDetailed', 'MinimumResponseTime'),
+                averageResponseTime: responseTimeFor('AverageResponseTimeDetailed', 'AverageResponseTime'),
+                maximumResponseTime: responseTimeFor('MaximumResponseTimeDetailed', 'MaximumResponseTime'),
+                responseTime: valueFor('ResponseTime'),
+                dnsServer: valueFor('DNSServer')
+            },
+            results: [...groupedResults.values()].sort((a, b) => a.index - b.index),
+            parameters,
+            refreshTask,
+            refreshError,
+            retrievedAt: new Date().toISOString()
+        };
+    }
+
+    async getTask(taskId) {
+        if (!/^[a-f0-9]{24}$/i.test(String(taskId || ''))) return null;
+        const response = await this.client.get('/tasks', {
+            params: { query: JSON.stringify({ _id: String(taskId) }) }
+        });
+        return Array.isArray(response.data) ? response.data[0] || null : null;
+    }
+
     async getDeviceTasks(serialNumber, limit = 20) {
         try {
             const device = await this.getDeviceBySerial(serialNumber);
-            const deviceId = device.id;
-
-            const response = await this.client.get(`/ devices / ${deviceId} / tasks`, {
-                params: { limit: limit }
+            const response = await this.client.get('/tasks', {
+                params: {
+                    query: JSON.stringify({ device: device.id }),
+                    limit
+                }
             });
 
             return {
@@ -1073,6 +1263,128 @@ class GenieACSClient {
             };
         } catch (error) {
             throw new Error(`Failed to get connected clients: ${error.message}`);
+        }
+    }
+    
+    // ==================== GENIEACS ADMIN CRUD METHODS ====================
+    async getProvisions() {
+        try {
+            const response = await this.client.get('/provisions');
+            return response.data || [];
+        } catch (error) {
+            if (error.response?.status === 404) return [];
+            throw new Error(`Failed to get provisions: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async uploadProvision(name, scriptText) {
+        try {
+            const response = await this.client.put(`/provisions/${encodeURIComponent(name)}`, scriptText, {
+                headers: { 'Content-Type': 'text/plain' }
+            });
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to save provision: ${error.response?.data || error.message}`);
+        }
+    }
+
+    async deleteProvision(name) {
+        try {
+            const response = await this.client.delete(`/provisions/${encodeURIComponent(name)}`);
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to delete provision: ${error.response?.data || error.message}`);
+        }
+    }
+
+    async getVirtualParameters() {
+        try {
+            const response = await this.client.get('/virtual_parameters');
+            return response.data || [];
+        } catch (error) {
+            if (error.response?.status === 404) return [];
+            throw new Error(`Failed to get virtual parameters: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async uploadVirtualParameter(name, scriptText) {
+        try {
+            const response = await this.client.put(`/virtual_parameters/${encodeURIComponent(name)}`, scriptText, {
+                headers: { 'Content-Type': 'text/plain' }
+            });
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to save virtual parameter: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async deleteVirtualParameter(name) {
+        try {
+            const response = await this.client.delete(`/virtual_parameters/${encodeURIComponent(name)}`);
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to delete virtual parameter: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async getPresets() {
+        try {
+            const response = await this.client.get('/presets');
+            return response.data || [];
+        } catch (error) {
+            if (error.response?.status === 404) return [];
+            throw new Error(`Failed to get presets: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async uploadPreset(name, presetJson) {
+        try {
+            const response = await this.client.put(`/presets/${encodeURIComponent(name)}`, presetJson);
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to save preset: ${error.response?.data || error.message}`);
+        }
+    }
+
+    async deletePreset(name) {
+        try {
+            const response = await this.client.delete(`/presets/${encodeURIComponent(name)}`);
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to delete preset: ${error.response?.data || error.message}`);
+        }
+    }
+
+    async getFiles() {
+        try {
+            const response = await this.client.get('/files');
+            return response.data || [];
+        } catch (error) {
+            if (error.response?.status === 404) return [];
+            throw new Error(`Failed to get files: ${error.response?.status || ''} ${error.response?.statusText || error.message}`);
+        }
+    }
+
+    async uploadFile(name, fileData, metadata = {}) {
+        try {
+            const response = await this.client.put(`/files/${encodeURIComponent(name)}`, fileData, {
+                headers: {
+                    'Content-Type': metadata.contentType || 'application/octet-stream',
+                    'ch-options': JSON.stringify(metadata)
+                }
+            });
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to upload file: ${error.response?.data || error.message}`);
+        }
+    }
+
+    async deleteFile(name) {
+        try {
+            const response = await this.client.delete(`/files/${encodeURIComponent(name)}`);
+            return response.data;
+        } catch (error) {
+            throw new Error(`Failed to delete file: ${error.response?.data || error.message}`);
         }
     }
 }

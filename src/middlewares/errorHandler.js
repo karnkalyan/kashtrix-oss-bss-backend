@@ -31,9 +31,7 @@ function errorHandler(error, req, res, next) {
     return res.status(error.status||502).json({connected:false,errorCode:error.code,message:'The device and Kashtrix could not agree on an SSH encryption algorithm.',negotiation:{direction:negotiation.direction||'unknown',category:negotiation.category||'unknown',profilesTried:error.profilesAttempted||[]},recommendations:['Verify that SSH version 2 is enabled on the device.','Review the device SSH encryption, MAC, host-key, and key-exchange configuration.','Upgrade device software when it supports only obsolete algorithms.','Use device-specific legacy compatibility only when required.'],requestId});
   }
   return res.status(error.status || 500).json({
-    error: error.message || 'Internal Server Error',
-    errorCode:error.code||undefined,
-    details: error.errors||{},
+    error: (error.status && error.status < 500) ? 'Request could not be completed.' : 'Internal server error.',
     requestId
   });
 }

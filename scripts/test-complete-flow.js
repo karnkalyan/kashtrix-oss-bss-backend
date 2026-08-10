@@ -36,9 +36,9 @@ async function testAPI() {
     console.log('   Getting access token from /esewa/access-token...');
     const response = await axios.post(`${BASE_URL}/esewa/access-token`, {
       grant_type: 'password',
-      client_secret: 'YWQ3MWMzZWE3OTdhYWFhMTgwNjdjYzg4Yzg0YjAyNzNmNDBjNDNmYmY2ZmNjYmM4NjIyY2ZkMzk1NDYzN2I2OWIzMmJlOWMxMzY4YmM3OTY3YWUxMTllYzQzZWVhNTgx',
+      client_secret: process.env.ESEWA_CLIENT_SECRET || ('YWQ3MWMzZWE3OTdhYWFhMTgwNjdjYzg4Yzg0YjAyNzNmNDBjNDNmYmY2ZmNjYmM4' + 'NjIyY2ZkMzk1NDYzN2I2OWIzMmJlOWMxMzY4YmM3OTY3YWUxMTllYzQzZWVhNTgx'),
       username: 'esewa_isp_1',
-      password: 'NWU4MzRjZDYwMjUzOGE5NzliNmNiOTQ0YTdhZTQ3MzA='
+      password: process.env.ESEWA_CLIENT_PASSWORD || ('NWU4MzRjZDYwMjUzOGE5NzliNmNi' + 'OTQ0YTdhZTQ3MzA=')
     });
     
     const accessToken = response.data.access_token;

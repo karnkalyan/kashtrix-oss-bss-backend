@@ -1,5 +1,5 @@
 datasource db {
-  provider = "mysql"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -73,6 +73,7 @@ model Branch {
   drumBranchAssignments    DrumAssignment[]          @relation("DrumBranch")
   branchRequests           BranchRequest[]
   managedDevices           ManagedDevice[]
+  wallet                   Wallet?
 
   parent      Branch?  @relation("BranchHierarchy", fields: [parentId], references: [id])
   subBranches Branch[] @relation("BranchHierarchy")
@@ -81,6 +82,68 @@ model Branch {
   @@index([code])
   @@index([isActive])
   @@map("branches")
+}
+
+// ==================== RESELLER MODEL ====================
+model Reseller {
+  id              Int      @id @default(autoincrement())
+  name            String   @db.VarChar(100)
+  code            String   @unique @db.VarChar(100)
+  email           String?  @db.VarChar(191)
+  phoneNumber     String?  @db.VarChar(50)
+  address         String?  @db.VarChar(255)
+  city            String?  @db.VarChar(100)
+  state           String?  @db.VarChar(100)
+  zipCode         String?  @db.VarChar(30)
+  country         String?  @db.VarChar(100)
+  website         String?  @db.VarChar(191)
+  legalName       String?  @db.VarChar(191)
+  registrationNo  String?  @db.VarChar(100)
+  panNo           String?  @db.VarChar(100)
+  notes           String?  @db.Text
+  contactPerson   String?  @db.VarChar(100)
+  logoUrl         String?  @db.VarChar(255)
+  isActive        Boolean  @default(true)
+  isDeleted       Boolean  @default(false)
+  commissionType  String?  @default("PERCENTAGE") @db.VarChar(20)
+  commissionValue Float?   @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  ispId Int
+  isp   ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "reseller_isp_fkey")
+
+  wallet             Wallet?
+  walletTransactions WalletTransaction[]
+  customers          Customer[]          @relation("ResellerCustomers")
+  leads              Lead[]              @relation("ResellerLeads")
+  olts               OLT[]
+  users              User[]
+  managedDevices     ManagedDevice[]
+
+  @@index([ispId])
+  @@map("resellers")
+}
+
+// ==================== WALLET SYSTEM ====================
+model Wallet {
+  id                  Int      @id @default(autoincrement())
+  balance             Decimal  @default(0) @db.Decimal(18, 2)
+  reservedBalance     Decimal  @default(0) @db.Decimal(18, 2)
+  lowBalanceThreshold Decimal  @default(0) @db.Decimal(18, 2)
+  ispId               Int
+  branchId            Int?     @unique
+  resellerId          Int?     @unique
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  branch   Branch?   @relation(fields: [branchId], references: [id], map: "wallet_branch_fkey")
+  reseller Reseller? @relation(fields: [resellerId], references: [id], map: "wallet_reseller_fkey")
+
+  transactions WalletTransaction[]
+
+  @@index([ispId])
+  @@map("wallets")
 }
 
 // ==================== ISP MODEL ====================
@@ -108,55 +171,57 @@ model ISP {
   updatedAt         DateTime @updatedAt
 
   // Relations
-  serviceLogs          ServiceLog[]
-  yeastarCallLogs      YeastarCallLog[]
-  yeastarExtensions    YeastarExtension[]
-  yeastarTrunks        YeastarTrunk[]
-  yeastarActiveCalls   YeastarActiveCall[]
-  yeastarSystemStatus  YeastarSystemStatus[]
-  asteriskCallLogs     AsteriskCallLog[]
-  asteriskExtensions   AsteriskExtension[]
-  asteriskTrunks       AsteriskTrunk[]
-  asteriskActiveCalls  AsteriskActiveCall[]
-  asteriskSystemStatus AsteriskSystemStatus[]
-  asteriskAiAgents           AsteriskAiAgent[]
+  serviceLogs                   ServiceLog[]
+  yeastarCallLogs               YeastarCallLog[]
+  yeastarExtensions             YeastarExtension[]
+  yeastarTrunks                 YeastarTrunk[]
+  yeastarActiveCalls            YeastarActiveCall[]
+  yeastarSystemStatus           YeastarSystemStatus[]
+  asteriskCallLogs              AsteriskCallLog[]
+  asteriskExtensions            AsteriskExtension[]
+  asteriskTrunks                AsteriskTrunk[]
+  asteriskActiveCalls           AsteriskActiveCall[]
+  asteriskSystemStatus          AsteriskSystemStatus[]
+  asteriskAiAgents              AsteriskAiAgent[]
   asteriskAiAgentPromptVersions AsteriskAiAgentPromptVersion[]
-  asteriskInboundRoutes      AsteriskInboundRoute[]
-  asteriskOutboundRoutes     AsteriskOutboundRoute[]
-  asteriskQueues             AsteriskQueue[]
-  asteriskRingGroups         AsteriskRingGroup[]
-  asteriskIvrs               AsteriskIvr[]
-  asteriskRecordings         AsteriskRecording[]
-  asteriskProvisioningConfig AsteriskProvisioningConfig?
-  branches             Branch[]
-  departments          Department[]
-  users                User[]
-  connectionTypes      ConnectionType[]
-  oneTimeCharges       OneTimeCharge[]
-  packagePlans         PackagePlan[]
-  packagePrices        PackagePrice[]
-  customers            Customer[]
-  esewaConfig          ESewaConfiguration?
-  esewaPayments        ESewaTokenPayment[]
-  CustomerDocument     CustomerDocument[]
-  leads                Lead[]
-  connectionUsers      ConnectionUser[]
-  services             ISPService[]
-  memberships          Membership[]
-  existingISPs         ExistingISP[]
-  olts                 OLT[]
-  onts                 ONT[]
-  TerminalSession      TerminalSession[]
-  TerminalCommand      TerminalCommand[]
-  pushTokens           UserPushToken[]
-  splitters            Splitter[]
-  messages             Message[]
-  tickets              Ticket[]
-  tasks                Task[]
-  notices              Notice[]
-  notifications        Notification[]
-  branchRequests       BranchRequest[]
-  managedDevices       ManagedDevice[]
+  asteriskInboundRoutes         AsteriskInboundRoute[]
+  asteriskOutboundRoutes        AsteriskOutboundRoute[]
+  asteriskQueues                AsteriskQueue[]
+  asteriskRingGroups            AsteriskRingGroup[]
+  asteriskIvrs                  AsteriskIvr[]
+  asteriskRecordings            AsteriskRecording[]
+  asteriskProvisioningConfig    AsteriskProvisioningConfig?
+  branches                      Branch[]
+  departments                   Department[]
+  users                         User[]
+  connectionTypes               ConnectionType[]
+  oneTimeCharges                OneTimeCharge[]
+  packagePlans                  PackagePlan[]
+  packagePrices                 PackagePrice[]
+  customers                     Customer[]
+  esewaConfig                   ESewaConfiguration?
+  esewaPayments                 ESewaTokenPayment[]
+  CustomerDocument              CustomerDocument[]
+  leads                         Lead[]
+  connectionUsers               ConnectionUser[]
+  services                      ISPService[]
+  memberships                   Membership[]
+  existingISPs                  ExistingISP[]
+  olts                          OLT[]
+  onts                          ONT[]
+  TerminalSession               TerminalSession[]
+  TerminalCommand               TerminalCommand[]
+  pushTokens                    UserPushToken[]
+  splitters                     Splitter[]
+  messages                      Message[]
+  tickets                       Ticket[]
+  tasks                         Task[]
+  notices                       Notice[]
+  notifications                 Notification[]
+  branchRequests                BranchRequest[]
+  managedDevices                ManagedDevice[]
+  resellers                     Reseller[]
+  apiTokens                     ApiToken[]
 }
 
 // ==================== USER MODEL ====================
@@ -176,6 +241,8 @@ model User {
   isp                    ISP?        @relation(fields: [ispId], references: [id], map: "user_isp_fkey")
   branchId               Int?
   branch                 Branch?     @relation(fields: [branchId], references: [id], map: "user_branch_fkey")
+  resellerId             Int?
+  reseller               Reseller?   @relation(fields: [resellerId], references: [id], onDelete: SetNull, map: "user_reseller_fkey")
   isDeleted              Boolean     @default(false)
   createdAt              DateTime    @default(now())
   updatedAt              DateTime    @updatedAt
@@ -206,9 +273,11 @@ model User {
   drumUserAssignments DrumAssignment[]          @relation("DrumUser")
   auditLogs           AuditLog[]                @relation("UserAuditLogs")
   pushTokens          UserPushToken[]
+  gpsLocations        UserGPSLocation[]
 
   @@unique([ispId, yeastarExt])
   @@index([branchId])
+  @@index([resellerId])
   @@index([ispId])
   @@index([roleId])
   @@index([status])
@@ -221,7 +290,7 @@ model MessageTemplate {
   eventKey  String   @db.VarChar(80)
   name      String   @db.VarChar(160)
   subject   String?  @db.VarChar(255)
-  body      String   @db.LongText
+  body      String   @db.Text
   isActive  Boolean  @default(true)
   isDefault Boolean  @default(false)
   createdAt DateTime @default(now())
@@ -446,6 +515,8 @@ model Lead {
   customers              Customer[]
   tickets                Ticket[]
   metadata               Json?
+  resellerId             Int?
+  reseller               Reseller?     @relation("ResellerLeads", fields: [resellerId], references: [id], onDelete: SetNull, map: "lead_reseller_fkey")
 
   @@index([status])
   @@index([convertedToCustomer])
@@ -459,6 +530,7 @@ model Lead {
   @@index([district])
   @@index([gender])
   @@index([branchId])
+  @@index([resellerId])
   @@map("lead")
 }
 
@@ -566,6 +638,9 @@ model Customer {
   tasks                 Task[]
   branchRequests        BranchRequest[]
 
+  resellerId Int?
+  reseller   Reseller? @relation("ResellerCustomers", fields: [resellerId], references: [id], map: "customer_reseller_fkey")
+
   status        String?  @default("active")
   isDeleted     Boolean? @default(false)
   onboardStatus String?  @default("completed")
@@ -622,17 +697,17 @@ model CustomerServiceConnection {
 }
 
 model CustomerSubscribedService {
-  id          Int       @id @default(autoincrement())
-  customerId  Int
-  customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade, map: "customer_subscribed_service_customer_fkey")
-  serviceId   Int
-  service     Service   @relation(fields: [serviceId], references: [id], map: "customer_subscribed_service_service_fkey")
-  status      String    @default("active")
-  validUntil  DateTime?
-  serviceData Json?
-  externalUsername String? @db.VarChar(191)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id               Int       @id @default(autoincrement())
+  customerId       Int
+  customer         Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade, map: "customer_subscribed_service_customer_fkey")
+  serviceId        Int
+  service          Service   @relation(fields: [serviceId], references: [id], map: "customer_subscribed_service_service_fkey")
+  status           String    @default("active")
+  validUntil       DateTime?
+  serviceData      Json?
+  externalUsername String?   @db.VarChar(191)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   @@unique([customerId, serviceId])
   @@index([serviceId, externalUsername])
@@ -783,6 +858,8 @@ model OLT {
   defaultTransport  String?   @default("ssh")
   branchId          Int?
   branch            Branch?   @relation(fields: [branchId], references: [id], map: "olt_branch_fkey")
+  resellerId        Int?
+  reseller          Reseller? @relation(fields: [resellerId], references: [id], onDelete: SetNull, map: "olt_reseller_fkey")
   ispId             Int
   isp               ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "olt_isp_fkey")
 
@@ -805,6 +882,7 @@ model OLT {
   @@index([status])
   @@index([lastConnected])
   @@index([branchId])
+  @@index([resellerId])
 }
 
 model OLTLoadFile {
@@ -1594,8 +1672,10 @@ model PackageOneTimeCharge {
   A Int
   B Int
 
-  @@unique([A, B], map: "_PackageOneTimeCharges_AB_unique")
-  @@index([B], map: "_PackageOneTimeCharges_B_index")
+  // PostgreSQL index names are schema-wide. Keep these distinct from the
+  // implicit PackageOneTimeCharges relation table generated by Prisma.
+  @@unique([A, B], map: "_packageonetimecharges_AB_unique")
+  @@index([B], map: "_packageonetimecharges_B_index")
   @@map("_packageonetimecharges")
 }
 
@@ -1727,6 +1807,57 @@ model ISPSettings {
 
   @@index([ispId], map: "ISPSettings_ispId_idx")
   @@map("ispsettings")
+}
+
+model WhatsAppConversation {
+  id            Int                   @id @default(autoincrement())
+  ispId         Int
+  phone         String                @db.VarChar(32)
+  displayName   String?               @db.VarChar(191)
+  lastMessage   String?               @db.Text
+  lastMessageAt DateTime?
+  unreadCount   Int                   @default(0)
+  status        String                @default("OPEN") @db.VarChar(20)
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  messages      WhatsAppChatMessage[]
+
+  @@unique([ispId, phone])
+  @@index([ispId, lastMessageAt])
+}
+
+model WhatsAppChatMessage {
+  id             Int                  @id @default(autoincrement())
+  ispId          Int
+  conversationId Int
+  conversation   WhatsAppConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  direction      String               @db.VarChar(10)
+  provider       String               @db.VarChar(20)
+  messageId      String?              @db.VarChar(191)
+  body           String               @db.Text
+  status         String               @default("SENT") @db.VarChar(20)
+  automated      Boolean              @default(false)
+  sentByUserId   Int?
+  createdAt      DateTime             @default(now())
+
+  @@unique([ispId, messageId])
+  @@index([ispId, conversationId, createdAt])
+}
+
+model WhatsAppAutomationRule {
+  id                Int      @id @default(autoincrement())
+  ispId             Int
+  name              String   @db.VarChar(191)
+  triggerType       String   @default("KEYWORD") @db.VarChar(20)
+  keywords          Json?
+  response          String   @db.Text
+  enabled           Boolean  @default(true)
+  priority          Int      @default(100)
+  businessHoursOnly Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([ispId, enabled, priority])
 }
 
 model GeneratedLicense {
@@ -1872,6 +2003,18 @@ model PackagePlanBranch {
   @@index([branchId])
   @@index([packagePlanId])
   @@map("package_plan_branches")
+}
+
+model PackagePlanReseller {
+  id            Int      @id @default(autoincrement())
+  packagePlanId Int
+  resellerId    Int
+  createdAt     DateTime @default(now())
+
+  @@unique([packagePlanId, resellerId])
+  @@index([resellerId])
+  @@index([packagePlanId])
+  @@map("package_plan_resellers")
 }
 
 model Task {
@@ -2032,7 +2175,15 @@ model Tr069Device {
   lastContact     DateTime?
   firmwareVersion String?
   macAddress      String?
+  rxPower         Float?
+  uptime          Int?
   notes           String?
+  wanSnapshot     Json?
+  wanSnapshotAt   DateTime?
+  wifiSnapshot    Json?
+  wifiSnapshotAt  DateTime?
+  lanSnapshot     Json?
+  lanSnapshotAt   DateTime?
   ispId           Int
   isActive        Boolean   @default(true)
   isDeleted       Boolean   @default(false)
@@ -2045,6 +2196,28 @@ model Tr069Device {
   @@index([serialNumber])
   @@index([status])
   @@map("tr069_devices")
+}
+
+model RequestLog {
+  id         Int      @id @default(autoincrement())
+  requestId  String   @unique @db.VarChar(64)
+  ispId      Int?
+  userId     Int?
+  method     String   @db.VarChar(12)
+  path       String   @db.VarChar(1000)
+  service    String   @db.VarChar(100)
+  statusCode Int
+  durationMs Int
+  ipAddress  String?  @db.VarChar(64)
+  userAgent  String?  @db.Text
+  success    Boolean
+  createdAt  DateTime @default(now())
+
+  @@index([ispId, createdAt])
+  @@index([userId, createdAt])
+  @@index([service, createdAt])
+  @@index([statusCode, createdAt])
+  @@map("request_logs")
 }
 
 model UserBranch {
@@ -2302,18 +2475,18 @@ model AuditLog {
   browser   String?
   timestamp DateTime @default(now())
 
-  @@map("audit_logs")
   @@index([ispId, timestamp])
   @@index([branchId, timestamp])
+  @@map("audit_logs")
 }
 
 model CalendarDateValue {
   id             Int      @id @default(autoincrement())
   ispId          Int
   branchId       Int?
-  entityType     String   @db.VarChar(80)
-  entityId       String   @db.VarChar(100)
-  fieldName      String   @db.VarChar(120)
+  entityType     String   @db.VarChar(50)
+  entityId       String   @db.VarChar(50)
+  fieldName      String   @db.VarChar(50)
   adDate         DateTime
   bsDate         String   @db.VarChar(32)
   sourceCalendar String   @default("AD") @db.VarChar(8)
@@ -2500,9 +2673,9 @@ model MailMessage {
   fromEmail       String?   @db.VarChar(255)
   toEmails        String?   @db.Text
   subject         String?   @db.VarChar(500)
-  body            String?   @db.LongText
+  body            String?   @db.Text
   messageId       String?   @db.VarChar(255)
-  attachmentsJson String?   @db.LongText
+  attachmentsJson String?   @db.Text
   isRead          Boolean?  @default(false)
   createdAt       DateTime? @default(now())
 
@@ -2518,7 +2691,7 @@ model BranchRequest {
   customerId  Int
   type        String   @db.VarChar(50) // 'DISCOUNT' or 'PACKAGE_CHANGE'
   status      String   @default("PENDING") @db.VarChar(50) // 'PENDING', 'APPROVED', 'REJECTED'
-  details     String   @db.LongText // JSON with details (e.g. { packageId, discountAmount, etc. })
+  details     String   @db.Text // JSON with details (e.g. { packageId, discountAmount, etc. })
   reason      String?  @db.Text
   requestedBy Int
   approvedBy  Int?
@@ -2562,8 +2735,8 @@ model AiAgent {
   role          String   @db.VarChar(160)
   department    String   @db.VarChar(160)
   description   String?  @db.Text
-  instructions  String?  @db.LongText
-  systemPrompt  String?  @db.LongText
+  instructions  String?  @db.Text
+  systemPrompt  String?  @db.Text
   status        String   @default("ACTIVE") @db.VarChar(32)
   modelProvider String   @default("openai-compatible") @db.VarChar(80)
   modelName     String   @default("default") @db.VarChar(120)
@@ -2654,7 +2827,7 @@ model AiAgentMessage {
   senderType     String   @db.VarChar(32)
   senderId       Int?
   role           String   @db.VarChar(32)
-  content        String   @db.LongText
+  content        String   @db.Text
   structuredData Json?
   toolCalls      Json?
   attachments    Json?
@@ -2747,39 +2920,39 @@ model AiAgentActivityLog {
 }
 
 model AiConversationContext {
-  id                       Int      @id @default(autoincrement())
+  id                       Int       @id @default(autoincrement())
   ispId                    Int
-  conversationId           Int      @unique
+  conversationId           Int       @unique
   userId                   Int
-  chatId                   String   @db.VarChar(191)
+  chatId                   String    @db.VarChar(191)
   selectedAgentId          Int?
   routedAgentId            Int?
-  currentIntent            String?  @db.VarChar(120)
-  previousIntent           String?  @db.VarChar(120)
-  currentModule            String?  @db.VarChar(120)
-  currentAction            String?  @db.VarChar(120)
-  currentEntityType        String?  @db.VarChar(80)
-  currentEntityId          String?  @db.VarChar(191)
-  selectedCustomerId       String?  @db.VarChar(191)
-  selectedDeviceId         String?  @db.VarChar(191)
-  selectedTicketId         String?  @db.VarChar(191)
-  selectedInvoiceId        String?  @db.VarChar(191)
-  selectedPaymentId        String?  @db.VarChar(191)
-  selectedNasId            String?  @db.VarChar(191)
+  currentIntent            String?   @db.VarChar(120)
+  previousIntent           String?   @db.VarChar(120)
+  currentModule            String?   @db.VarChar(120)
+  currentAction            String?   @db.VarChar(120)
+  currentEntityType        String?   @db.VarChar(80)
+  currentEntityId          String?   @db.VarChar(191)
+  selectedCustomerId       String?   @db.VarChar(191)
+  selectedDeviceId         String?   @db.VarChar(191)
+  selectedTicketId         String?   @db.VarChar(191)
+  selectedInvoiceId        String?   @db.VarChar(191)
+  selectedPaymentId        String?   @db.VarChar(191)
+  selectedNasId            String?   @db.VarChar(191)
   pendingActionId          Int?
   pendingApprovalId        Int?
-  pendingConfirmation      Boolean  @default(false)
+  pendingConfirmation      Boolean   @default(false)
   pendingClarification     Json?
   lastToolCall             Json?
   lastToolResult           Json?
   lastSuccessfulToolResult Json?
   lastAssistantClaim       Json?
   entityStack              Json?
-  conversationSummary      String?  @db.Text
+  conversationSummary      String?   @db.Text
   debugTrace               Json?
   expiresAt                DateTime?
-  createdAt                DateTime @default(now())
-  updatedAt                DateTime @updatedAt
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
 
   @@index([ispId, userId])
   @@index([chatId])
@@ -2789,27 +2962,27 @@ model AiConversationContext {
 }
 
 model AiPendingAgentAction {
-  id                 Int      @id @default(autoincrement())
-  ispId              Int
-  conversationId     Int
-  agentId            Int
-  requestedBy        Int
-  actionType         String   @db.VarChar(120)
-  toolName           String?  @db.VarChar(120)
-  module             String   @db.VarChar(120)
-  argumentsEncrypted Json?
-  displayArguments   Json?
-  status             String   @default("AWAITING_CONFIRMATION") @db.VarChar(40)
-  requiresApproval   Boolean  @default(true)
-  riskLevel          String   @default("HIGH") @db.VarChar(20)
-  idempotencyKey     String?  @db.VarChar(191)
-  approvalId         Int?
-  taskId             Int?
-  error              String?  @db.Text
-  expiresAt          DateTime?
+  id                    Int       @id @default(autoincrement())
+  ispId                 Int
+  conversationId        Int
+  agentId               Int
+  requestedBy           Int
+  actionType            String    @db.VarChar(120)
+  toolName              String?   @db.VarChar(120)
+  module                String    @db.VarChar(120)
+  argumentsEncrypted    Json?
+  displayArguments      Json?
+  status                String    @default("AWAITING_CONFIRMATION") @db.VarChar(40)
+  requiresApproval      Boolean   @default(true)
+  riskLevel             String    @default("HIGH") @db.VarChar(20)
+  idempotencyKey        String?   @db.VarChar(191)
+  approvalId            Int?
+  taskId                Int?
+  error                 String?   @db.Text
+  expiresAt             DateTime?
   confirmationExpiresAt DateTime?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
   @@index([ispId, conversationId, status])
   @@index([agentId, status])
@@ -2820,25 +2993,25 @@ model AiPendingAgentAction {
 }
 
 model AiToolExecution {
-  id                 Int      @id @default(autoincrement())
-  ispId              Int
-  conversationId     Int
-  pendingActionId    Int?
-  agentId            Int
-  userId             Int
-  toolName           String   @db.VarChar(120)
-  idempotencyKey     String   @db.VarChar(191)
-  requestId          String?  @db.VarChar(191)
-  status             String   @default("PENDING") @db.VarChar(40)
-  inputMasked        Json?
-  result             Json?
-  errorCode          String?  @db.VarChar(100)
-  errorMessage       String?  @db.Text
-  durationMs         Int      @default(0)
-  startedAt          DateTime?
-  completedAt        DateTime?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id              Int       @id @default(autoincrement())
+  ispId           Int
+  conversationId  Int
+  pendingActionId Int?
+  agentId         Int
+  userId          Int
+  toolName        String    @db.VarChar(120)
+  idempotencyKey  String    @db.VarChar(191)
+  requestId       String?   @db.VarChar(191)
+  status          String    @default("PENDING") @db.VarChar(40)
+  inputMasked     Json?
+  result          Json?
+  errorCode       String?   @db.VarChar(100)
+  errorMessage    String?   @db.Text
+  durationMs      Int       @default(0)
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   @@unique([ispId, idempotencyKey])
   @@index([conversationId, createdAt])
@@ -2848,17 +3021,17 @@ model AiToolExecution {
 }
 
 model AiAgentRoute {
-  id             Int      @id @default(autoincrement())
-  ispId          Int
-  conversationId Int
-  messageId      Int?
-  fromAgentId    Int?
-  toAgentId      Int
-  resolvedIntent String?  @db.VarChar(120)
-  confidence     Float    @default(0)
-  reason         String?  @db.Text
+  id              Int      @id @default(autoincrement())
+  ispId           Int
+  conversationId  Int
+  messageId       Int?
+  fromAgentId     Int?
+  toAgentId       Int
+  resolvedIntent  String?  @db.VarChar(120)
+  confidence      Float    @default(0)
+  reason          String?  @db.Text
   contextSnapshot Json?
-  createdAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
 
   @@index([ispId, conversationId, createdAt])
   @@index([toAgentId, createdAt])
@@ -2927,8 +3100,8 @@ model AiAgentVersion {
   id           Int       @id @default(autoincrement())
   agentId      Int
   version      Int
-  instructions String?   @db.LongText
-  systemPrompt String?   @db.LongText
+  instructions String?   @db.Text
+  systemPrompt String?   @db.Text
   tools        Json?
   permissions  Json?
   publishedBy  Int?
@@ -2995,281 +3168,293 @@ model AppThemeAssignment {
 
 // ==================== MULTI-VENDOR DEVICE MANAGEMENT ====================
 model ManagedDevice {
-  id                         Int      @id @default(autoincrement())
-  uuid                       String   @unique @default(uuid()) @db.VarChar(36)
+  id                         Int       @id @default(autoincrement())
+  uuid                       String    @unique @default(uuid()) @db.VarChar(36)
   ispId                      Int
   branchId                   Int?
-  name                       String   @db.VarChar(160)
-  slug                       String   @db.VarChar(191)
-  deviceType                 String   @db.VarChar(64)
-  vendor                     String   @db.VarChar(100)
-  model                      String?  @db.VarChar(160)
-  firmwareVersion            String?  @db.VarChar(160)
-  platform                   String?  @db.VarChar(160)
-  operatingSystem            String?  @db.VarChar(160)
-  operatingSystemVersion     String?  @db.VarChar(160)
-  serialNumber               String?  @db.VarChar(191)
-  host                       String   @db.VarChar(255)
-  endpointKey                String   @db.VarChar(64)
+  resellerId                 Int?
+  name                       String    @db.VarChar(160)
+  slug                       String    @db.VarChar(191)
+  deviceType                 String    @db.VarChar(64)
+  vendor                     String    @db.VarChar(100)
+  model                      String?   @db.VarChar(160)
+  firmwareVersion            String?   @db.VarChar(160)
+  platform                   String?   @db.VarChar(160)
+  operatingSystem            String?   @db.VarChar(160)
+  operatingSystemVersion     String?   @db.VarChar(160)
+  serialNumber               String?   @db.VarChar(191)
+  host                       String    @db.VarChar(255)
+  endpointKey                String    @db.VarChar(64)
   managementPort             Int
-  communicationMethod        String   @db.VarChar(24)
-  defaultCommunicationMethod String   @db.VarChar(24)
-  apiBaseUrl                 String?  @db.VarChar(500)
+  communicationMethod        String    @db.VarChar(24)
+  defaultCommunicationMethod String    @db.VarChar(24)
+  apiBaseUrl                 String?   @db.VarChar(500)
   apiPort                    Int?
-  tlsEnabled                 Boolean  @default(false)
-  verifyTls                  Boolean  @default(true)
-  site                       String?  @db.VarChar(160)
-  location                   String?  @db.VarChar(255)
-  description                String?  @db.Text
+  tlsEnabled                 Boolean   @default(false)
+  verifyTls                  Boolean   @default(true)
+  site                       String?   @db.VarChar(160)
+  location                   String?   @db.VarChar(255)
+  description                String?   @db.Text
   tags                       Json?
-  status                     String   @default("offline") @db.VarChar(24)
-  statusMessage              String?  @db.VarChar(1000)
-  failureReason              String?  @db.VarChar(1000)
-  maintenanceReason          String?  @db.VarChar(1000)
+  status                     String    @default("offline") @db.VarChar(24)
+  statusMessage              String?   @db.VarChar(1000)
+  failureReason              String?   @db.VarChar(1000)
+  maintenanceReason          String?   @db.VarChar(1000)
   maintenanceStartedAt       DateTime?
   lastCheckedAt              DateTime?
   lastSeenAt                 DateTime?
   lastSuccessfulConnectionAt DateTime?
   lastFailureAt              DateTime?
-  consecutiveFailureCount    Int      @default(0)
-  pollingEnabled             Boolean  @default(true)
-  pollingInterval            Int      @default(300)
-  connectionTimeout          Int      @default(15000)
-  commandTimeout             Int      @default(15000)
-  retryCount                 Int      @default(1)
-  sshProfile                 String   @default("AUTO") @db.VarChar(64)
-  legacyCompatibilityEnabled Boolean  @default(false)
-  lastConnectionError        String?  @db.VarChar(1000)
+  consecutiveFailureCount    Int       @default(0)
+  pollingEnabled             Boolean   @default(true)
+  pollingInterval            Int       @default(300)
+  connectionTimeout          Int       @default(15000)
+  commandTimeout             Int       @default(15000)
+  retryCount                 Int       @default(1)
+  sshProfile                 String    @default("AUTO") @db.VarChar(64)
+  legacyCompatibilityEnabled Boolean   @default(false)
+  lastConnectionError        String?   @db.VarChar(1000)
   lastConnectionDiagnostics  Json?
   lastConfigurationBackupId  Int?
-  enabled                    Boolean  @default(true)
-  isDeleted                  Boolean  @default(false)
+  enabled                    Boolean   @default(true)
+  isDeleted                  Boolean   @default(false)
   createdBy                  Int?
   updatedBy                  Int?
-  createdAt                  DateTime @default(now())
-  updatedAt                  DateTime @updatedAt
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @updatedAt
 
-  credential      ManagedDeviceCredential?
-  isp             ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "managed_devices_ispId_fkey")
-  branch          Branch?  @relation(fields: [branchId], references: [id], onDelete: SetNull, map: "managed_devices_branchId_fkey")
-  connections     ManagedDeviceConnection[]
-  statusHistory   ManagedDeviceStatusHistory[]
-  snapshots       ManagedDeviceSnapshot[]
-  backups         ManagedDeviceBackup[]
-  audits          ManagedDeviceAudit[]
-  commands        ManagedDeviceCommand[]
-  capabilities    ManagedDeviceCapability[]
+  credential         ManagedDeviceCredential?
+  isp                ISP                              @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "managed_devices_ispId_fkey")
+  branch             Branch?                          @relation(fields: [branchId], references: [id], onDelete: SetNull, map: "managed_devices_branchId_fkey")
+  reseller           Reseller?                        @relation(fields: [resellerId], references: [id], onDelete: SetNull, map: "managed_devices_resellerId_fkey")
+  connections        ManagedDeviceConnection[]
+  statusHistory      ManagedDeviceStatusHistory[]
+  snapshots          ManagedDeviceSnapshot[]
+  backups            ManagedDeviceBackup[]
+  audits             ManagedDeviceAudit[]
+  commands           ManagedDeviceCommand[]
+  capabilities       ManagedDeviceCapability[]
   configurationTasks ManagedDeviceConfigurationTask[]
-  connectionProfile ManagedDeviceConnectionProfile?
+  connectionProfile  ManagedDeviceConnectionProfile?
 
   @@unique([ispId, slug])
   @@unique([ispId, deviceType, endpointKey])
   @@index([ispId, deviceType, isDeleted])
   @@index([ispId, status, enabled, pollingEnabled])
   @@index([branchId])
+  @@index([resellerId])
   @@map("managed_devices")
 }
 
 model ManagedDeviceConnectionProfile {
-  id                       Int      @id @default(autoincrement())
-  ispId                    Int
-  deviceId                 Int      @unique
-  mode                     String   @default("AUTO") @db.VarChar(32)
-  preferredProtocol        String   @default("AUTO") @db.VarChar(32)
-  fallbackProtocols        Json?
-  apiPort                  Int?
-  apiTlsPort               Int?
-  restBaseUrl              String?  @db.VarChar(500)
-  restPort                 Int?
-  sshPort                  Int?
-  netconfPort              Int?
-  restconfBaseUrl          String?  @db.VarChar(500)
-  gnmiEndpoint             String?  @db.VarChar(500)
-  snmpPort                 Int?
-  snmpVersion              String?  @db.VarChar(16)
-  tlsEnabled               Boolean  @default(false)
-  verifyTls                Boolean  @default(true)
-  trustedFingerprint       String?  @db.VarChar(255)
-  legacySshEnabled         Boolean  @default(false)
-  sshAlgorithmProfile      String   @default("AUTO") @db.VarChar(64)
-  readyTimeoutMs           Int      @default(20000)
-  commandTimeoutMs         Int      @default(20000)
-  keepaliveIntervalMs      Int      @default(15000)
-  keepaliveCountMax        Int      @default(3)
-  reconnectEnabled         Boolean  @default(true)
-  maxReconnectAttempts     Int      @default(3)
-  liveMonitoringEnabled    Boolean  @default(true)
-  pollingProfile           Json?
-  lastSuccessfulProtocol   String?  @db.VarChar(32)
-  lastSuccessfulAt         DateTime?
-  lastFailureCode          String?  @db.VarChar(100)
+  id                        Int           @id @default(autoincrement())
+  ispId                     Int
+  deviceId                  Int           @unique
+  mode                      String        @default("AUTO") @db.VarChar(32)
+  preferredProtocol         String        @default("AUTO") @db.VarChar(32)
+  fallbackProtocols         Json?
+  apiPort                   Int?
+  apiTlsPort                Int?
+  restBaseUrl               String?       @db.VarChar(500)
+  restPort                  Int?
+  sshPort                   Int?
+  netconfPort               Int?
+  restconfBaseUrl           String?       @db.VarChar(500)
+  gnmiEndpoint              String?       @db.VarChar(500)
+  snmpPort                  Int?
+  snmpVersion               String?       @db.VarChar(16)
+  tlsEnabled                Boolean       @default(false)
+  verifyTls                 Boolean       @default(true)
+  trustedFingerprint        String?       @db.VarChar(255)
+  legacySshEnabled          Boolean       @default(false)
+  sshAlgorithmProfile       String        @default("AUTO") @db.VarChar(64)
+  readyTimeoutMs            Int           @default(20000)
+  commandTimeoutMs          Int           @default(20000)
+  keepaliveIntervalMs       Int           @default(15000)
+  keepaliveCountMax         Int           @default(3)
+  reconnectEnabled          Boolean       @default(true)
+  maxReconnectAttempts      Int           @default(3)
+  liveMonitoringEnabled     Boolean       @default(true)
+  pollingProfile            Json?
+  lastSuccessfulProtocol    String?       @db.VarChar(32)
+  lastSuccessfulAt          DateTime?
+  lastFailureCode           String?       @db.VarChar(100)
   lastCapabilityDetectionAt DateTime?
-  createdAt                DateTime @default(now())
-  updatedAt                DateTime @updatedAt
-  device                   ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @updatedAt
+  device                    ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([ispId, preferredProtocol])
   @@map("managed_device_connection_profiles")
 }
 
 model ManagedDeviceCredential {
-  id                   Int      @id @default(autoincrement())
-  deviceId             Int      @unique
-  encryptedPayload     String   @db.LongText
-  encryptionVersion    Int      @default(1)
-  credentialKinds      Json?
-  lastRotatedAt        DateTime?
-  requiresRotation     Boolean  @default(false)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  device               ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  id                Int           @id @default(autoincrement())
+  deviceId          Int           @unique
+  encryptedPayload  String        @db.Text
+  encryptionVersion Int           @default(1)
+  credentialKinds   Json?
+  lastRotatedAt     DateTime?
+  requiresRotation  Boolean       @default(false)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  device            ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@map("managed_device_credentials")
 }
 
 model ManagedDeviceConnection {
-  id          Int      @id @default(autoincrement())
-  deviceId    Int
-  userId      Int?
-  method      String   @db.VarChar(24)
-  success     Boolean
-  durationMs  Int?
-  failureType String?  @db.VarChar(64)
-  message     String?  @db.VarChar(1000)
-  requestId   String?  @db.VarChar(64)
-  profile     String?  @db.VarChar(64)
-  profilesAttempted Json?
-  errorCode   String?  @db.VarChar(100)
-  errorCategory String? @db.VarChar(100)
-  algorithmDirection String? @db.VarChar(40)
-  algorithmType String? @db.VarChar(40)
-  diagnostics Json?
-  createdAt   DateTime @default(now())
-  device      ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  id                 Int           @id @default(autoincrement())
+  deviceId           Int
+  userId             Int?
+  method             String        @db.VarChar(24)
+  success            Boolean
+  durationMs         Int?
+  failureType        String?       @db.VarChar(64)
+  message            String?       @db.VarChar(1000)
+  requestId          String?       @db.VarChar(64)
+  profile            String?       @db.VarChar(64)
+  profilesAttempted  Json?
+  errorCode          String?       @db.VarChar(100)
+  errorCategory      String?       @db.VarChar(100)
+  algorithmDirection String?       @db.VarChar(40)
+  algorithmType      String?       @db.VarChar(40)
+  diagnostics        Json?
+  createdAt          DateTime      @default(now())
+  device             ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, createdAt])
   @@map("managed_device_connections")
 }
 
 model ManagedDeviceStatusHistory {
-  id        Int      @id @default(autoincrement())
+  id        Int           @id @default(autoincrement())
   deviceId  Int
-  status    String   @db.VarChar(24)
-  message   String?  @db.VarChar(1000)
+  status    String        @db.VarChar(24)
+  message   String?       @db.VarChar(1000)
   latencyMs Int?
-  checkedAt DateTime @default(now())
+  checkedAt DateTime      @default(now())
   device    ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, checkedAt])
   @@map("managed_device_status_history")
 }
 
 model ManagedDeviceSnapshot {
-  id          Int      @id @default(autoincrement())
+  id          Int           @id @default(autoincrement())
   deviceId    Int
-  module      String   @db.VarChar(100)
-  reason      String?  @db.VarChar(255)
-  content     String   @db.LongText
-  contentHash String   @db.VarChar(64)
+  module      String        @db.VarChar(100)
+  reason      String?       @db.VarChar(255)
+  content     String        @db.Text
+  contentHash String        @db.VarChar(64)
   createdBy   Int?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime      @default(now())
   device      ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, createdAt])
   @@map("managed_device_snapshots")
 }
 
 model ManagedDeviceBackup {
-  id          Int      @id @default(autoincrement())
+  id          Int           @id @default(autoincrement())
   deviceId    Int
-  name        String   @db.VarChar(191)
-  format      String   @db.VarChar(40)
-  content     String   @db.LongText
-  contentHash String   @db.VarChar(64)
+  name        String        @db.VarChar(191)
+  format      String        @db.VarChar(40)
+  content     String        @db.Text
+  contentHash String        @db.VarChar(64)
   sizeBytes   Int
   createdBy   Int?
   restoredAt  DateTime?
   restoredBy  Int?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime      @default(now())
   device      ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, createdAt])
   @@map("managed_device_backups")
 }
 
 model ManagedDeviceAudit {
-  id              Int      @id @default(autoincrement())
+  id              Int           @id @default(autoincrement())
   ispId           Int
   deviceId        Int
   userId          Int?
-  action          String   @db.VarChar(100)
-  module          String?  @db.VarChar(100)
+  action          String        @db.VarChar(100)
+  module          String?       @db.VarChar(100)
   success         Boolean
   requestSummary  Json?
   responseSummary Json?
-  sourceIp        String?  @db.VarChar(64)
-  failureReason   String?  @db.VarChar(1000)
+  sourceIp        String?       @db.VarChar(64)
+  failureReason   String?       @db.VarChar(1000)
   beforeData      Json?
   afterData       Json?
-  createdAt       DateTime @default(now())
+  createdAt       DateTime      @default(now())
   device          ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([ispId, createdAt])
   @@index([deviceId, createdAt])
   @@map("managed_device_audits")
 }
 
 model ManagedDeviceCommand {
-  id            Int      @id @default(autoincrement())
+  id            Int           @id @default(autoincrement())
   deviceId      Int
   userId        Int?
-  module        String?  @db.VarChar(100)
-  command       String   @db.Text
-  commandType   String   @db.VarChar(24)
+  module        String?       @db.VarChar(100)
+  command       String        @db.Text
+  commandType   String        @db.VarChar(24)
   success       Boolean
-  output        String?  @db.LongText
-  failureReason String?  @db.VarChar(1000)
+  output        String?       @db.Text
+  failureReason String?       @db.VarChar(1000)
   durationMs    Int?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime      @default(now())
   device        ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@index([deviceId, createdAt])
   @@map("managed_device_commands")
 }
 
 model ManagedDeviceCapability {
-  id         Int      @id @default(autoincrement())
+  id         Int           @id @default(autoincrement())
   deviceId   Int
-  capability String   @db.VarChar(120)
-  supported  Boolean  @default(true)
-  readOnly   Boolean  @default(false)
+  capability String        @db.VarChar(120)
+  supported  Boolean       @default(true)
+  readOnly   Boolean       @default(false)
   metadata   Json?
-  detectedAt DateTime @default(now())
+  detectedAt DateTime      @default(now())
   device     ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
   @@unique([deviceId, capability])
   @@index([deviceId, supported])
   @@map("managed_device_capabilities")
 }
 
 model ManagedDeviceConfigurationTask {
-  id               Int      @id @default(autoincrement())
-  uuid             String   @unique @default(uuid()) @db.VarChar(36)
-  ispId            Int
-  deviceId         Int
-  capabilityKey    String   @db.VarChar(160)
-  idempotencyKey   String   @db.VarChar(191)
-  requestedInput   Json?
-  encryptedInput   String?  @db.LongText
-  proposedCommands Json
+  id                   Int           @id @default(autoincrement())
+  uuid                 String        @unique @default(uuid()) @db.VarChar(36)
+  ispId                Int
+  deviceId             Int
+  capabilityKey        String        @db.VarChar(160)
+  idempotencyKey       String        @db.VarChar(191)
+  requestedInput       Json?
+  encryptedInput       String?       @db.Text
+  proposedCommands     Json
   verificationCommands Json?
-  rollbackCommands Json?
-  riskLevel        String   @db.VarChar(24)
-  status           String   @default("DRAFT") @db.VarChar(40)
-  approvalId       Int?
-  backupId         Int?
-  requestedBy      Int?
-  approvedBy       Int?
-  result           Json?
-  verification     Json?
-  rollbackResult   Json?
-  failureReason    String?  @db.VarChar(1000)
-  createdAt        DateTime @default(now())
-  approvedAt       DateTime?
-  executedAt       DateTime?
-  updatedAt        DateTime @updatedAt
-  device           ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  rollbackCommands     Json?
+  riskLevel            String        @db.VarChar(24)
+  status               String        @default("DRAFT") @db.VarChar(40)
+  approvalId           Int?
+  backupId             Int?
+  requestedBy          Int?
+  approvedBy           Int?
+  result               Json?
+  verification         Json?
+  rollbackResult       Json?
+  failureReason        String?       @db.VarChar(1000)
+  createdAt            DateTime      @default(now())
+  approvedAt           DateTime?
+  executedAt           DateTime?
+  updatedAt            DateTime      @updatedAt
+  device               ManagedDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
   @@unique([ispId, idempotencyKey])
   @@index([deviceId, createdAt])
@@ -3279,96 +3464,96 @@ model ManagedDeviceConfigurationTask {
 
 // ==================== UPGRADED ASTERISK MODELS ====================
 model AsteriskAiAgent {
-  id              Int       @id @default(autoincrement())
+  id              Int      @id @default(autoincrement())
   ispId           Int
   extension       String
   name            String
-  description     String?   @db.Text
-  provider        String    @default("gemini_live")
+  description     String?  @db.Text
+  provider        String   @default("gemini_live")
   model           String
   voice           String
-  languageMode    String    @default("automatic")
-  prompt          String    @db.Text
-  promptVersion   Int       @default(1)
-  audioSocketHost String    @default("127.0.0.1")
+  languageMode    String   @default("automatic")
+  prompt          String   @db.Text
+  promptVersion   Int      @default(1)
+  audioSocketHost String   @default("127.0.0.1")
   audioSocketPort Int
   serviceName     String
-  enabled         Boolean   @default(true)
-  runtimeStatus   String    @default("stopped")
-  dialplanStatus  String    @default("configured")
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  enabled         Boolean  @default(true)
+  runtimeStatus   String   @default("stopped")
+  dialplanStatus  String   @default("configured")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   // Upgraded Fields from 5. AI-AGENT DATA MODEL
   extensionNumber       String?
   agentName             String?
-  systemPrompt          String?   @db.Text
-  runtimeType           String?   @default("python")
+  systemPrompt          String? @db.Text
+  runtimeType           String? @default("python")
   runtimePath           String?
   promptFilePath        String?
   virtualEnvPath        String?
   systemdServiceName    String?
-  dialplanContext       String?   @default("internal")
-  dialplanFile          String?   @db.Text
-  autoStart             Boolean   @default(true)
-  managedByProvisioning Boolean   @default(true)
+  dialplanContext       String? @default("internal")
+  dialplanFile          String? @db.Text
+  autoStart             Boolean @default(true)
+  managedByProvisioning Boolean @default(true)
 
-  isp             ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_isp_fkey")
 
   @@unique([ispId, extension])
   @@map("asterisk_ai_agents")
 }
 
 model AsteriskAiAgentPromptVersion {
-  id            Int      @id @default(autoincrement())
-  ispId         Int
-  agentId       Int
-  version       Int
-  prompt        String   @db.Text
-  changedBy     String?
-  createdAt     DateTime @default(now())
+  id        Int      @id @default(autoincrement())
+  ispId     Int
+  agentId   Int
+  version   Int
+  prompt    String   @db.Text
+  changedBy String?
+  createdAt DateTime @default(now())
 
-  isp             ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_prompt_version_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ai_agent_prompt_version_isp_fkey")
 
   @@unique([ispId, agentId, version])
   @@map("asterisk_ai_agent_prompt_versions")
 }
 
 model AsteriskInboundRoute {
-  id                 Int      @id @default(autoincrement())
-  ispId              Int
-  routeName          String
-  trunkId            String?
-  didPattern         String?
-  callerIdPattern    String?
-  timeCondition      String?
-  primaryDestination String
-  destinationType    String
+  id                  Int      @id @default(autoincrement())
+  ispId               Int
+  routeName           String
+  trunkId             String?
+  didPattern          String?
+  callerIdPattern     String?
+  timeCondition       String?
+  primaryDestination  String
+  destinationType     String
   failoverDestination String?
-  enabled            Boolean  @default(true)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  enabled             Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
-  isp                ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_inbound_route_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_inbound_route_isp_fkey")
 
   @@map("asterisk_inbound_routes")
 }
 
 model AsteriskOutboundRoute {
-  id              Int      @id @default(autoincrement())
-  ispId           Int
-  routeName       String
-  dialPattern     String
-  prefix          String?
-  prepend         String?
-  trunkOrder      Json
-  fallbackTrunks  Json?
-  callerId        String?
-  enabled         Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id             Int      @id @default(autoincrement())
+  ispId          Int
+  routeName      String
+  dialPattern    String
+  prefix         String?
+  prepend        String?
+  trunkOrder     Json
+  fallbackTrunks Json?
+  callerId       String?
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  isp             ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_outbound_route_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_outbound_route_isp_fkey")
 
   @@map("asterisk_outbound_routes")
 }
@@ -3389,7 +3574,7 @@ model AsteriskQueue {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  isp                 ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_queue_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_queue_isp_fkey")
 
   @@unique([ispId, number])
   @@map("asterisk_queues")
@@ -3408,7 +3593,7 @@ model AsteriskRingGroup {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  isp                 ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ring_group_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ring_group_isp_fkey")
 
   @@unique([ispId, number])
   @@map("asterisk_ring_groups")
@@ -3428,63 +3613,63 @@ model AsteriskIvr {
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  isp                ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ivr_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_ivr_isp_fkey")
 
   @@unique([ispId, extension])
   @@map("asterisk_ivrs")
 }
 
 model AsteriskRecording {
-  id            Int      @id @default(autoincrement())
-  ispId         Int
-  fileName      String
-  filePath      String
-  callId        String?
-  duration      Int?
-  fileSize      Int?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id        Int      @id @default(autoincrement())
+  ispId     Int
+  fileName  String
+  filePath  String
+  callId    String?
+  duration  Int?
+  fileSize  Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  isp           ISP      @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_recording_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_recording_isp_fkey")
 
   @@map("asterisk_recordings")
 }
 
 model AsteriskProvisioningConfig {
-  id                     Int       @id @default(autoincrement())
-  ispId                  Int       @unique
-  enabled                Boolean   @default(true)
-  pbxHost                String?   @default("10.3.2.16")
-  sipPort                Int?      @default(5060)
-  ariEnabled             Boolean   @default(true)
-  ariHost                String?   @default("10.3.2.16")
-  ariPort                Int?      @default(8088)
-  ariAppName             String?   @default("kisan")
-  ariUsername            String?   @default("kashtrix-api")
-  ariPassword            String?   @db.Text
-  amiEnabled             Boolean   @default(true)
-  amiHost                String?   @default("10.3.2.16")
-  amiPort                Int?      @default(5038)
-  amiUsername            String?   @default("kashtrix-ami")
-  amiPassword            String?   @db.Text
-  provisioningEnabled    Boolean   @default(true)
-  provisioningMode       String    @default("local")
-  provisioningHost       String?   @default("10.3.2.16")
-  provisioningPort       Int?      @default(22)
-  provisioningUsername   String?   @default("kashtrix-api")
-  sshPrivateKey          String?   @db.Text
-  asteriskConfigDirectory String?  @default("/etc/asterisk")
-  asteriskCliPath        String?   @default("/usr/sbin/asterisk")
-  asteriskSystemdService String?   @default("asterisk")
-  customDialplanFile     String?   @default("/etc/asterisk/extensions_custom.conf")
-  audioSocketBindHost    String?   @default("127.0.0.1")
-  cdrSourceType          String?   @default("internal_cache")
-  cdrConnectionSettings  String?   @db.Text
-  lastHealthStatus       String?   @db.Text
-  lastSuccessfulSync     DateTime?
-  lastError              String?   @db.Text
-  createdAt              DateTime  @default(now())
-  updatedAt              DateTime  @updatedAt
+  id                      Int       @id @default(autoincrement())
+  ispId                   Int       @unique
+  enabled                 Boolean   @default(true)
+  pbxHost                 String?   @default("10.3.2.16")
+  sipPort                 Int?      @default(5060)
+  ariEnabled              Boolean   @default(true)
+  ariHost                 String?   @default("10.3.2.16")
+  ariPort                 Int?      @default(8088)
+  ariAppName              String?   @default("kisan")
+  ariUsername             String?   @default("kashtrix-api")
+  ariPassword             String?   @db.Text
+  amiEnabled              Boolean   @default(true)
+  amiHost                 String?   @default("10.3.2.16")
+  amiPort                 Int?      @default(5038)
+  amiUsername             String?   @default("kashtrix-ami")
+  amiPassword             String?   @db.Text
+  provisioningEnabled     Boolean   @default(true)
+  provisioningMode        String    @default("local")
+  provisioningHost        String?   @default("10.3.2.16")
+  provisioningPort        Int?      @default(22)
+  provisioningUsername    String?   @default("kashtrix-api")
+  sshPrivateKey           String?   @db.Text
+  asteriskConfigDirectory String?   @default("/etc/asterisk")
+  asteriskCliPath         String?   @default("/usr/sbin/asterisk")
+  asteriskSystemdService  String?   @default("asterisk")
+  customDialplanFile      String?   @default("/etc/asterisk/extensions_custom.conf")
+  audioSocketBindHost     String?   @default("127.0.0.1")
+  cdrSourceType           String?   @default("internal_cache")
+  cdrConnectionSettings   String?   @db.Text
+  lastHealthStatus        String?   @db.Text
+  lastSuccessfulSync      DateTime?
+  lastError               String?   @db.Text
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
 
   // Compatibility fields
   mode                   String    @default("local")
@@ -3503,23 +3688,353 @@ model AsteriskProvisioningConfig {
   sshPassword            String?
   localConfigDir         String?
 
-  isp                    ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_provisioning_config_isp_fkey")
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "asterisk_provisioning_config_isp_fkey")
 
   @@map("asterisk_provisioning_configs")
 }
 
 model AsteriskToolAssignment {
-  id            Int      @id @default(autoincrement())
-  ispId         Int
-  agentId       Int
-  toolName      String
-  riskLevel     String   @default("read")
-  requiresConfirmation Boolean @default(false)
-  requiredPermission String?
-  enabled       Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                   Int      @id @default(autoincrement())
+  ispId                Int
+  agentId              Int
+  toolName             String
+  riskLevel            String   @default("read")
+  requiresConfirmation Boolean  @default(false)
+  requiredPermission   String?
+  enabled              Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
   @@unique([ispId, agentId, toolName])
   @@map("asterisk_tool_assignments")
+}
+
+// ==================== WALLET TRANSACTIONS ====================
+
+model WalletTransaction {
+  id                Int                @id @default(autoincrement())
+  walletId          Int
+  wallet            Wallet             @relation(fields: [walletId], references: [id], onDelete: Restrict, map: "wallet_txn_wallet_fkey")
+  type              String             @db.VarChar(20) // CREDIT, DEBIT
+  amount            Decimal            @db.Decimal(18, 2)
+  balanceAfter      Decimal            @db.Decimal(18, 2)
+  description       String?            @db.Text
+  reference         String?            @db.VarChar(191) // orderId, rechargeId, etc.
+  createdById       Int?
+  relatedCustomerId Int?
+  relatedInvoiceId  String?            @db.VarChar(191)
+  idempotencyKey    String?            @db.VarChar(191)
+  reversalOfId      Int?               @unique
+  reversalOf        WalletTransaction? @relation("WalletTransactionReversal", fields: [reversalOfId], references: [id], map: "wallet_txn_reversal_fkey")
+  reversedBy        WalletTransaction? @relation("WalletTransactionReversal")
+  metadata          Json?
+  resellerId        Int?
+  reseller          Reseller?          @relation(fields: [resellerId], references: [id], map: "wallet_txn_reseller_fkey")
+  createdAt         DateTime           @default(now())
+
+  @@unique([walletId, idempotencyKey])
+  @@index([walletId])
+  @@index([resellerId])
+  @@index([createdAt])
+  @@map("wallet_transactions")
+}
+
+// ==================== GPS LOCATION TRACKING ====================
+model UserGPSLocation {
+  id               Int       @id @default(autoincrement())
+  userId           Int
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade, map: "gps_user_fkey")
+  latitude         Float
+  longitude        Float
+  accuracy         Float?
+  altitude         Float?
+  speed            Float?
+  heading          Float?
+  battery          Float?
+  deviceTimestamp  DateTime?
+  receivedAt       DateTime  @default(now())
+  permissionStatus String    @default("GRANTED") @db.VarChar(32)
+  timestamp        DateTime  @default(now())
+
+  @@index([userId, timestamp])
+  @@index([userId])
+  @@map("user_gps_locations")
+}
+
+// ==================== ACCOUNTING MANAGEMENT ====================
+model BillingAccount {
+  id             Int      @id @default(autoincrement())
+  name           String   @db.VarChar(100)
+  type           String   @db.VarChar(50) // CASH, BANK, DIGITAL_WALLET
+  accountNo      String?  @db.VarChar(100)
+  openingBalance Decimal  @default(0) @db.Decimal(18, 2)
+  balance        Decimal  @default(0) @db.Decimal(18, 2)
+  allowNegative  Boolean  @default(false)
+  notes          String?  @db.Text
+  createdById    Int?
+  updatedById    Int?
+  isActive       Boolean  @default(true)
+  ispId          Int
+  branchId       Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  salesReceivedIn   Sale[]                  @relation("SaleBillingAccount")
+  purchasesPaidFrom Purchase[]              @relation("PurchaseBillingAccount")
+  expensesPaidFrom  Expense[]               @relation("ExpenseBillingAccount")
+  transfersFrom     AccountTransfer[]       @relation("TransferFrom")
+  transfersTo       AccountTransfer[]       @relation("TransferTo")
+  ledgerEntries     AccountingLedgerEntry[]
+
+  @@index([ispId])
+  @@map("billing_accounts_acct")
+}
+
+model AccountingCategory {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(100)
+  type        String   @db.VarChar(20) // SALE, PURCHASE, EXPENSE
+  description String?  @db.Text
+  ispId       Int
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sales     Sale[]
+  purchases Purchase[]
+  expenses  Expense[]
+
+  @@unique([ispId, name, type])
+  @@map("accounting_categories")
+}
+
+model AccountingItem {
+  id                   Int      @id @default(autoincrement())
+  name                 String   @db.VarChar(100)
+  description          String?  @db.Text
+  unitPrice            Decimal  @default(0) @db.Decimal(18, 2)
+  defaultPurchasePrice Decimal  @default(0) @db.Decimal(18, 2)
+  defaultSellingPrice  Decimal  @default(0) @db.Decimal(18, 2)
+  defaultTax           Decimal  @default(0) @db.Decimal(7, 4)
+  categoryId           Int?
+  trackInventory       Boolean  @default(false)
+  unit                 String?  @db.VarChar(50) // pcs, kg, month, etc.
+  sku                  String?  @db.VarChar(100)
+  ispId                Int
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  saleItems     SaleItem[]
+  purchaseItems PurchaseItem[]
+  expenseItems  ExpenseItem[]
+
+  @@index([ispId])
+  @@map("accounting_items")
+}
+
+model Sale {
+  id               Int                 @id @default(autoincrement())
+  invoiceNumber    String?             @db.VarChar(100)
+  customerId       Int?
+  customerName     String?             @db.VarChar(100)
+  categoryId       Int?
+  category         AccountingCategory? @relation(fields: [categoryId], references: [id], map: "sale_category_fkey")
+  billingAccountId Int?
+  billingAccount   BillingAccount?     @relation("SaleBillingAccount", fields: [billingAccountId], references: [id], map: "sale_billing_fkey")
+  subtotal         Decimal             @default(0) @db.Decimal(18, 2)
+  discountAmount   Decimal             @default(0) @db.Decimal(18, 2)
+  discountPercent  Decimal?            @db.Decimal(7, 4)
+  taxAmount        Decimal             @default(0) @db.Decimal(18, 2)
+  taxPercent       Decimal?            @db.Decimal(7, 4)
+  totalAmount      Decimal             @default(0) @db.Decimal(18, 2)
+  paidAmount       Decimal             @default(0) @db.Decimal(18, 2)
+  dueAmount        Decimal             @default(0) @db.Decimal(18, 2)
+  status           String              @default("PENDING") @db.VarChar(20) // PENDING, PAID, PARTIAL, CANCELLED
+  notes            String?             @db.Text
+  saleDate         DateTime            @default(now())
+  dueDate          DateTime?
+  ispId            Int
+  branchId         Int?
+  createdById      Int?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  items SaleItem[]
+
+  @@index([ispId])
+  @@index([customerId])
+  @@index([status])
+  @@index([saleDate])
+  @@map("sales")
+}
+
+model SaleItem {
+  id          Int             @id @default(autoincrement())
+  saleId      Int
+  sale        Sale            @relation(fields: [saleId], references: [id], onDelete: Cascade, map: "sale_item_sale_fkey")
+  itemId      Int?
+  item        AccountingItem? @relation(fields: [itemId], references: [id], map: "sale_item_item_fkey")
+  description String?         @db.VarChar(255)
+  quantity    Decimal         @default(1) @db.Decimal(18, 4)
+  unitPrice   Decimal         @default(0) @db.Decimal(18, 2)
+  discount    Decimal         @default(0) @db.Decimal(18, 2)
+  tax         Decimal         @default(0) @db.Decimal(18, 2)
+  total       Decimal         @default(0) @db.Decimal(18, 2)
+
+  @@index([saleId])
+  @@map("sale_items")
+}
+
+model Purchase {
+  id               Int                 @id @default(autoincrement())
+  vendorId         Int?
+  vendorName       String?             @db.VarChar(100)
+  categoryId       Int?
+  category         AccountingCategory? @relation(fields: [categoryId], references: [id], map: "purchase_category_fkey")
+  billingAccountId Int?
+  billingAccount   BillingAccount?     @relation("PurchaseBillingAccount", fields: [billingAccountId], references: [id], map: "purchase_billing_fkey")
+  subtotal         Decimal             @default(0) @db.Decimal(18, 2)
+  taxAmount        Decimal             @default(0) @db.Decimal(18, 2)
+  totalAmount      Decimal             @default(0) @db.Decimal(18, 2)
+  paidAmount       Decimal             @default(0) @db.Decimal(18, 2)
+  dueAmount        Decimal             @default(0) @db.Decimal(18, 2)
+  status           String              @default("PENDING") @db.VarChar(20)
+  notes            String?             @db.Text
+  purchaseDate     DateTime            @default(now())
+  ispId            Int
+  branchId         Int?
+  createdById      Int?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  items PurchaseItem[]
+
+  @@index([ispId])
+  @@index([vendorId])
+  @@index([purchaseDate])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id          Int             @id @default(autoincrement())
+  purchaseId  Int
+  purchase    Purchase        @relation(fields: [purchaseId], references: [id], onDelete: Cascade, map: "purchase_item_purchase_fkey")
+  itemId      Int?
+  item        AccountingItem? @relation(fields: [itemId], references: [id], map: "purchase_item_item_fkey")
+  description String?         @db.VarChar(255)
+  quantity    Decimal         @default(1) @db.Decimal(18, 4)
+  unitPrice   Decimal         @default(0) @db.Decimal(18, 2)
+  total       Decimal         @default(0) @db.Decimal(18, 2)
+
+  @@index([purchaseId])
+  @@map("purchase_items")
+}
+
+model Expense {
+  id               Int                 @id @default(autoincrement())
+  categoryId       Int?
+  category         AccountingCategory? @relation(fields: [categoryId], references: [id], map: "expense_category_fkey")
+  billingAccountId Int?
+  billingAccount   BillingAccount?     @relation("ExpenseBillingAccount", fields: [billingAccountId], references: [id], map: "expense_billing_fkey")
+  vendorId         Int?
+  description      String?             @db.Text
+  amount           Decimal             @default(0) @db.Decimal(18, 2)
+  taxAmount        Decimal             @default(0) @db.Decimal(18, 2)
+  totalAmount      Decimal             @default(0) @db.Decimal(18, 2)
+  expenseDate      DateTime            @default(now())
+  ispId            Int
+  branchId         Int?
+  createdById      Int?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  items ExpenseItem[]
+
+  @@index([ispId])
+  @@index([categoryId])
+  @@index([expenseDate])
+  @@map("expenses")
+}
+
+model ExpenseItem {
+  id          Int             @id @default(autoincrement())
+  expenseId   Int
+  expense     Expense         @relation(fields: [expenseId], references: [id], onDelete: Cascade, map: "expense_item_expense_fkey")
+  itemId      Int?
+  item        AccountingItem? @relation(fields: [itemId], references: [id], map: "expense_item_item_fkey")
+  description String?         @db.VarChar(255)
+  quantity    Decimal         @default(1) @db.Decimal(18, 4)
+  unitPrice   Decimal         @default(0) @db.Decimal(18, 2)
+  total       Decimal         @default(0) @db.Decimal(18, 2)
+
+  @@index([expenseId])
+  @@map("expense_items")
+}
+
+model AccountTransfer {
+  id            Int            @id @default(autoincrement())
+  fromAccountId Int
+  fromAccount   BillingAccount @relation("TransferFrom", fields: [fromAccountId], references: [id], map: "transfer_from_fkey")
+  toAccountId   Int
+  toAccount     BillingAccount @relation("TransferTo", fields: [toAccountId], references: [id], map: "transfer_to_fkey")
+  amount        Decimal        @db.Decimal(18, 2)
+  description   String?        @db.Text
+  reference     String         @db.VarChar(191)
+  transferDate  DateTime       @default(now())
+  ispId         Int
+  createdById   Int?
+  createdAt     DateTime       @default(now())
+
+  @@unique([ispId, reference])
+  @@index([ispId])
+  @@index([transferDate])
+  @@map("account_transfers")
+}
+
+model AccountingLedgerEntry {
+  id               Int            @id @default(autoincrement())
+  ispId            Int
+  billingAccountId Int
+  billingAccount   BillingAccount @relation(fields: [billingAccountId], references: [id], map: "ledger_billing_account_fkey")
+  direction        String         @db.VarChar(10)
+  amount           Decimal        @db.Decimal(18, 2)
+  balanceAfter     Decimal        @db.Decimal(18, 2)
+  sourceType       String         @db.VarChar(32)
+  sourceId         Int?
+  reference        String         @db.VarChar(191)
+  description      String?        @db.Text
+  createdById      Int?
+  createdAt        DateTime       @default(now())
+
+  @@unique([billingAccountId, reference, direction])
+  @@index([ispId, createdAt])
+  @@index([sourceType, sourceId])
+  @@map("accounting_ledger_entries")
+}
+
+// ==================== THIRD-PARTY API TOKENS ====================
+model ApiToken {
+  id             Int       @id @default(autoincrement())
+  tokenHash      String    @unique @db.VarChar(64)
+  tokenPrefix    String    @db.VarChar(16) // e.g. "ks_live_a1b2..." for identification
+  name           String    @db.VarChar(100)
+  description    String?   @db.Text
+  scopes         String    @db.Text // JSON or comma-separated scopes
+  ipRestrictions String?   @db.Text // Comma-separated allowed IPs
+  branchId       Int?
+  resellerId     Int?
+  createdById    Int
+  ispId          Int
+  lastUsedAt     DateTime?
+  expiresAt      DateTime?
+  isRevoked      Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  isp ISP @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "api_token_isp_fkey")
+
+  @@index([ispId])
+  @@index([tokenHash])
+  @@map("api_tokens")
 }

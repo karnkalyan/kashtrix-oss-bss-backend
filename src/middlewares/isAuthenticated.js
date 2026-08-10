@@ -39,6 +39,7 @@ module.exports = (prisma) => {
         email: true,
         ispId: true,
         branchId: true,
+        resellerId: true,
         isDeleted: true,
         yeastarExt: true,
         customerId: true,
@@ -114,7 +115,8 @@ module.exports = (prisma) => {
       branchId: user.branchId, // User's primary branch
       selectedBranchId: selectedBranchId, // Current context branch
       extId: user.yeastarExt,
-      customerId: user.customerId
+      customerId: user.customerId,
+      resellerId: user.resellerId
     };
 
     req.ispId = user.ispId;

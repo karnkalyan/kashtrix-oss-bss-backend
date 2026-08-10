@@ -2,6 +2,7 @@ const express = require('express');
 const { ServiceController } = require('../controllers/services.controller');
 const isAuthenticated = require('../middlewares/isAuthenticated');
 const checkPermission = require('../middlewares/checkPermission');
+const checkAnyPermission = require('../middlewares/checkAnyPermission');
 
 module.exports = (prisma) => {
     const router = express.Router();
@@ -105,6 +106,9 @@ module.exports = (prisma) => {
     router.get('/radius/act/:username', checkPermission('services_read'), serviceController.getRadiusAccountbyUser.bind(serviceController));
     router.get('/radius/users/:username', checkPermission('services_read'), serviceController.getRadiusUser.bind(serviceController));
     router.get('/radius/tables/:table', checkPermission('services_read'), serviceController.getRadiusTable.bind(serviceController));
+    router.post('/radius/tables/:table', checkPermission('services_manage'), serviceController.createRadiusTableRow.bind(serviceController));
+    router.put('/radius/tables/:table/:id', checkPermission('services_manage'), serviceController.updateRadiusTableRow.bind(serviceController));
+    router.delete('/radius/tables/:table/:id', checkPermission('services_manage'), serviceController.deleteRadiusTableRow.bind(serviceController));
     router.post('/radius/users', checkPermission('services_manage'), serviceController.createRadiusUser.bind(serviceController));
 
     router.delete('/radius/users/:username', checkPermission('services_manage'), serviceController.deleteRadiusUser.bind(serviceController));
@@ -128,6 +132,7 @@ module.exports = (prisma) => {
     router.get('/genieacs/devices/:serialNumber', checkPermission('services_read'), serviceController.getGenieACSDeviceBySerial.bind(serviceController));
 
     router.get('/genieacs/devices/:serialNumber/deviceinfo', checkPermission('services_read'), serviceController.getGenieACSDeviceInfo.bind(serviceController));
+    router.get('/genieacs/devices/:serialNumber/parameters', checkAnyPermission(['tr069_parameters_view', 'services_read']), serviceController.getGenieACSDeviceParameters.bind(serviceController));
 
     router.get('/genieacs/devices/:serialNumber/waninfo', checkPermission('services_read'), serviceController.getGenieACSDeviceWanInfo.bind(serviceController));
 
@@ -140,6 +145,7 @@ module.exports = (prisma) => {
 
 
     router.get('/genieacs/devices/:serialNumber/laninfo', checkPermission('services_read'), serviceController.getGenieACSDeviceLANInfo.bind(serviceController));
+    router.put('/genieacs/devices/:serialNumber/laninfo', checkPermission('services_manage'), serviceController.updateGenieACSDeviceLANInfo.bind(serviceController));
 
     router.get('/genieacs/devices/:serialNumber/status', checkPermission('services_read'), serviceController.getGenieACSDeviceStatus.bind(serviceController));
     router.get('/genieacs/devices/:serialNumber/connected-clients', checkPermission('services_read'), serviceController.getGenieACSConnectedClients.bind(serviceController));
@@ -157,6 +163,8 @@ module.exports = (prisma) => {
 
 
     router.post('/genieacs/devices/:serialNumber/refresh', checkPermission('services_manage'), serviceController.refreshGenieACSObject.bind(serviceController));
+    router.post('/genieacs/devices/:serialNumber/diagnostics', checkAnyPermission(['tr069_diagnostics_run', 'services_manage']), serviceController.runGenieACSDiagnostic.bind(serviceController));
+    router.get('/genieacs/devices/:serialNumber/diagnostics/result', checkAnyPermission(['tr069_diagnostics_run', 'tr069_parameters_view', 'services_read']), serviceController.getGenieACSDiagnosticResult.bind(serviceController));
     router.post('/genieacs/devices/:serialNumber/configure-wifi', checkPermission('services_manage'), serviceController.configureGenieACSWiFi.bind(serviceController));
     router.post('/genieacs/devices/:serialNumber/enable-acl', checkPermission('services_manage'), serviceController.enableGenieACSACL.bind(serviceController));
     router.post('/genieacs/devices/:serialNumber/reboot', checkPermission('services_manage'), serviceController.rebootGenieACSDevice.bind(serviceController));

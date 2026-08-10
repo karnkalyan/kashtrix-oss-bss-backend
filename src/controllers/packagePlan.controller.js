@@ -131,7 +131,7 @@ async function enrichPackagePlans(prisma, plans) {
   const connectionTypeIds = [...new Set(list.map(plan => plan.connectionType).filter(Boolean))];
   const planIds = list.map(plan => plan.id);
 
-  const [connectionTypes, branchLinks] = await Promise.all([
+  const [connectionTypes, branchLinks, resellerLinks] = await Promise.all([
     connectionTypeIds.length
       ? prisma.ConnectionType.findMany({
         where: { id: { in: connectionTypeIds } },
@@ -140,6 +140,11 @@ async function enrichPackagePlans(prisma, plans) {
       : [],
     planIds.length
       ? prisma.PackagePlanBranch.findMany({
+        where: { packagePlanId: { in: planIds } }
+      })
+      : [],
+    planIds.length
+      ? prisma.packagePlanReseller.findMany({
         where: { packagePlanId: { in: planIds } }
       })
       : []
@@ -152,10 +157,19 @@ async function enrichPackagePlans(prisma, plans) {
       select: { id: true, name: true, code: true }
     })
     : [];
+  const resellerIds = [...new Set(resellerLinks.map(link => link.resellerId).filter(Boolean))];
+  const resellers = resellerIds.length
+    ? await prisma.reseller.findMany({
+      where: { id: { in: resellerIds }, isDeleted: false },
+      select: { id: true, name: true, code: true }
+    })
+    : [];
 
   const connectionTypeById = new Map(connectionTypes.map(type => [type.id, type]));
   const branchById = new Map(branches.map(branch => [branch.id, branch]));
+  const resellerById = new Map(resellers.map(reseller => [reseller.id, reseller]));
   const linksByPlanId = new Map();
+  const resellerLinksByPlanId = new Map();
 
   branchLinks.forEach(link => {
     if (!linksByPlanId.has(link.packagePlanId)) linksByPlanId.set(link.packagePlanId, []);
@@ -164,11 +178,19 @@ async function enrichPackagePlans(prisma, plans) {
       branch: branchById.get(link.branchId) || null
     });
   });
+  resellerLinks.forEach(link => {
+    if (!resellerLinksByPlanId.has(link.packagePlanId)) resellerLinksByPlanId.set(link.packagePlanId, []);
+    resellerLinksByPlanId.get(link.packagePlanId).push({
+      ...link,
+      reseller: resellerById.get(link.resellerId) || null
+    });
+  });
 
   const enriched = list.map(plan => ({
     ...plan,
     connectionTypeDetails: plan.connectionType ? connectionTypeById.get(plan.connectionType) || null : null,
-    branches: linksByPlanId.get(plan.id) || []
+    branches: linksByPlanId.get(plan.id) || [],
+    resellers: resellerLinksByPlanId.get(plan.id) || []
   }));
 
   return Array.isArray(plans) ? enriched : enriched[0];
@@ -184,7 +206,8 @@ async function createPackagePlan(req, res, next) {
       packageType, allowRename, fupApply, fupLimitGb, fupPenaltyPlanId, isFupPackage,
       onlyRenewal, applyFramedPool, framedPoolValue, customRadiusAttributes,
       vendorProfiles, maxDiscountPercentage, maxDiscountCount, highPriority,
-      branchIds
+      branchIds,
+      resellerIds
     } = req.body;
 
     const connectionTypeId = Number(connectionType);
@@ -242,6 +265,20 @@ async function createPackagePlan(req, res, next) {
         skipDuplicates: true
       });
     }
+    if (Array.isArray(resellerIds) && resellerIds.length > 0) {
+      const validResellers = await req.prisma.reseller.findMany({
+        where: { id: { in: resellerIds.map(Number) }, ispId: Number(req.ispId), isDeleted: false },
+        select: { id: true }
+      });
+      if (validResellers.length !== new Set(resellerIds.map(Number)).size) {
+        await req.prisma.PackagePlan.update({ where: { id: plan.id }, data: { isDeleted: true } });
+        return res.status(400).json({ error: 'One or more reseller assignments are invalid' });
+      }
+      await req.prisma.packagePlanReseller.createMany({
+        data: validResellers.map(reseller => ({ packagePlanId: plan.id, resellerId: reseller.id })),
+        skipDuplicates: true
+      });
+    }
 
     // RADIUS sync
     try {
@@ -267,8 +304,23 @@ async function createPackagePlan(req, res, next) {
 
 async function listPackagePlans(req, res, next) {
   try {
+    const scopedPlanLinks = req.user?.resellerId
+      ? await req.prisma.packagePlanReseller.findMany({
+        where: { resellerId: Number(req.user.resellerId) },
+        select: { packagePlanId: true }
+      })
+      : req.branchId
+        ? await req.prisma.PackagePlanBranch.findMany({
+          where: { branchId: Number(req.branchId) },
+          select: { packagePlanId: true }
+        })
+      : null;
     const list = await req.prisma.PackagePlan.findMany({
-      where: { isDeleted: false, ispId: req.ispId },
+      where: {
+        isDeleted: false,
+        ispId: req.ispId,
+        ...(scopedPlanLinks ? { id: { in: scopedPlanLinks.map(link => link.packagePlanId) } } : {})
+      },
       orderBy: { createdAt: 'desc' }
     });
     return res.json(await enrichPackagePlans(req.prisma, list));
@@ -278,6 +330,19 @@ async function listPackagePlans(req, res, next) {
 async function getPackagePlanById(req, res, next) {
   try {
     const id = Number(req.params.id);
+    if (req.user?.resellerId) {
+      const assignment = await req.prisma.packagePlanReseller.findFirst({
+        where: { packagePlanId: id, resellerId: Number(req.user.resellerId) },
+        select: { id: true }
+      });
+      if (!assignment) return res.status(404).json({ error: 'Plan not found' });
+    } else if (req.branchId) {
+      const assignment = await req.prisma.PackagePlanBranch.findFirst({
+        where: { packagePlanId: id, branchId: Number(req.branchId) },
+        select: { id: true }
+      });
+      if (!assignment) return res.status(404).json({ error: 'Plan not found' });
+    }
     const plan = await req.prisma.PackagePlan.findFirst({
       where: { id, ispId: req.ispId, isDeleted: false }
     });
@@ -332,6 +397,23 @@ async function updatePackagePlan(req, res, next) {
       if (req.body.branchIds.length > 0) {
         await req.prisma.PackagePlanBranch.createMany({
           data: req.body.branchIds.map(bId => ({ packagePlanId: id, branchId: Number(bId) })),
+          skipDuplicates: true
+        });
+      }
+    }
+    if (Array.isArray(req.body.resellerIds)) {
+      const requestedIds = [...new Set(req.body.resellerIds.map(Number))];
+      const validResellers = requestedIds.length ? await req.prisma.reseller.findMany({
+        where: { id: { in: requestedIds }, ispId: Number(req.ispId), isDeleted: false },
+        select: { id: true }
+      }) : [];
+      if (validResellers.length !== requestedIds.length) {
+        return res.status(400).json({ error: 'One or more reseller assignments are invalid' });
+      }
+      await req.prisma.packagePlanReseller.deleteMany({ where: { packagePlanId: id } });
+      if (validResellers.length) {
+        await req.prisma.packagePlanReseller.createMany({
+          data: validResellers.map(reseller => ({ packagePlanId: id, resellerId: reseller.id })),
           skipDuplicates: true
         });
       }

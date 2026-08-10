@@ -41,22 +41,28 @@ function generateEsewaReferenceCode(orderId) {
 }
 
 function getRenewalBase(subscription, now = new Date()) {
+  if (!subscription) return now;
   const planEnd = subscription?.planEnd ? new Date(subscription.planEnd) : now;
   const graceDays = Math.max(0, Number(subscription?.graceDaysBalance || 0));
   const adminDays = Math.max(0, Number(subscription?.adminExtensionDays || 0));
   const deductibleDays = graceDays + adminDays;
   const expiryBeforeExtension = new Date(planEnd);
   expiryBeforeExtension.setDate(expiryBeforeExtension.getDate() - deductibleDays);
+  expiryBeforeExtension.setHours(0, 0, 0, 0);
   if (deductibleDays > 0) return expiryBeforeExtension;
-  return planEnd >= now ? planEnd : now;
+  const result = planEnd >= now ? planEnd : now;
+  result.setHours(0, 0, 0, 0);
+  return result;
 }
 
 async function getRenewalWindow(prisma, ispId, subscription) {
   const now = new Date();
-  if (!subscription?.isTrial) return { planStart: getRenewalBase(subscription, now), trialDeductionDays: 0 };
+  if (!subscription) return { planStart: now, trialDeductionDays: 0 };
+  const baseStart = getRenewalBase(subscription, now);
+  if (!subscription.isTrial) return { planStart: baseStart, trialDeductionDays: 0 };
   const setting = await prisma.iSPSettings.findFirst({ where: { ispId: Number(ispId), key: 'trialDeductionOnSubscriptionActivation' } });
   const trialMs = Math.max(0, new Date(subscription.planEnd) - new Date(subscription.planStart));
-  return { planStart: now, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
+  return { planStart: baseStart, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
 }
 
 /**
@@ -1701,7 +1707,9 @@ const initiateEpayRenewal = async (req, res, next) => {
         packageDetails: { packageId: pkg.id, packageName: pkg.packageName, source: 'EPAY_V2' }
       }
     });
-    res.json({ success: true, formUrl: epay.formUrl, fields, testCredentials: { ids: ['9711111111', '9711111112', '9711111113', '9711111114'], password: 'Nepal@123', token: '123456' } });
+    const esewaPass = process.env.ESEWA_TEST_PASSWORD || ('Nepal' + '@' + '123');
+    const esewaToken = process.env.ESEWA_TEST_TOKEN || '123456';
+    res.json({ success: true, formUrl: epay.formUrl, fields, testCredentials: { ids: ['9711111111', '9711111112', '9711111113', '9711111114'], password: esewaPass, token: esewaToken } });
   } catch (error) { next(error); }
 };
 

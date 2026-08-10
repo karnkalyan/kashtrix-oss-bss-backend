@@ -48,10 +48,15 @@ class SSHSession {
     }
 
     async connect() {
+        let kbAttempts = 0;
         return new Promise((resolve, reject) => {
             this.client
                 .on('banner', banner => { this.diagnostics.sshBanner=String(banner||'').slice(0,500); })
                 .on('keyboard-interactive', (_name, _instructions, _language, prompts, finish) => {
+                    kbAttempts++;
+                    if (kbAttempts > 2) {
+                        return finish([]);
+                    }
                     this.diagnostics.authenticationMethod='keyboard-interactive';
                     finish((prompts||[]).map(() => this.config.password || ''));
                 })

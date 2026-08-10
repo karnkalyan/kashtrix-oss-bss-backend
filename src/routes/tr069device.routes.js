@@ -6,8 +6,11 @@ const {
   syncDevices,
   syncDevice,
   listDevices,
+  setProviderSecret,
+  verifyProviderSecret,
   getRadiusCredentialsBySerial,
   getDeviceBySerial,
+  refreshDeviceOptics,
   linkLead,
   unlinkLead,
   deleteDevice
@@ -21,6 +24,9 @@ module.exports = (prisma) => {
 
   // Require authentication for all tr069 device endpoints
   router.use(isAuthenticated(prisma));
+
+  router.post('/provider-access/configure', checkPermission('settings_update'), setProviderSecret);
+  router.post('/provider-access/verify', checkPermission('services_read'), verifyProviderSecret);
 
   // Sync from GenieACS to local DB
   router.post(
@@ -46,6 +52,12 @@ module.exports = (prisma) => {
     '/:serialNumber/radius-credentials',
     checkPermission('services_manage'),
     getRadiusCredentialsBySerial
+  );
+
+  router.post(
+    '/:serialNumber/refresh-optics',
+    checkPermission('services_manage'),
+    refreshDeviceOptics
   );
 
   // Get device by serial number

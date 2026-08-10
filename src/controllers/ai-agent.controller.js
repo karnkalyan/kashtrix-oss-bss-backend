@@ -10,6 +10,8 @@ const { extractTaskCredentials, sealTaskCredentials, openTaskCredentials, hasTas
 const { loadConversationState, ensureConversationState, resolveFollowUp, saveTurnState, createPendingAction, updatePendingAction } = require('../services/ai-conversation-memory.service');
 const { resolveStructuredIntent } = require('../services/ai-intent.service');
 const { orchestrateTools } = require('../services/ai-tool-orchestrator.service');
+const { resolveModel, logModelUsage } = require('../services/model-resolution.service');
+const { TASK_STATES, transitionTaskState, writeAgentComment, writeTaskProgress, requestUserInput, reportTaskFailure, reportTaskCompletion, processWaitingTasks: processWaitingTaskComms } = require('../services/ai-task-communication.service');
 
 const cleanText = (value, max = 10000) => String(value || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').slice(0, max);
 const parseId = value => Number.parseInt(value, 10);
@@ -169,42 +171,113 @@ async function runQueuedTask({prisma,ispId,user,agent,task}){
   const claim=await prisma.aiAgentTask.updateMany({where:{id:task.id,ispId,status:'PENDING'},data:{status:'IN_PROGRESS',startedAt:new Date(),completedAt:null,error:null}});
   if(!claim.count)return;
   await prisma.aiPendingAgentAction.updateMany({where:{taskId:task.id,ispId,status:{in:['AWAITING_APPROVAL','APPROVED','FAILED']}},data:{status:'EXECUTING',error:null}}).catch(()=>{});
+
+  // Resolve the consistent model for this task
+  const modelResolution = await resolveModel({ prisma, ispId, agent, task, context: 'task' });
+  const ticketId = Number(task.input?.ticketId) || null;
+
+  // Write initial progress comment
+  if (ticketId) {
+    await writeAgentComment(prisma, {
+      ticketId, agentId: agent.id, ispId,
+      content: `I am now working on this task. Using ${modelResolution.provider}/${modelResolution.model} (source: ${modelResolution.source}).`,
+      commentType: 'PROGRESS'
+    });
+  }
+
   try{
     const current=await prisma.aiAgentTask.findFirst({where:{id:task.id,ispId}})||task;
+
+    // Write analyzing stage
+    await writeTaskProgress(prisma, {
+      taskId: current.id, agentId: agent.id, ispId,
+      userId: user?.id || current.requestedBy,
+      stage: 'ANALYZING',
+      description: `Analyzing task: ${current.title}`
+    });
+
     if(current.taskType==='NAS_PROVISION'){
+      if (ticketId) await writeAgentComment(prisma, { ticketId, agentId: agent.id, ispId, content: 'Starting NAS provisioning workflow...', commentType: 'PROGRESS' });
       const execution=await executeNasProvisionTask({prisma,ispId,user,agent,task:current});
       await prisma.aiAgentTask.update({where:{id:current.id},data:{status:'COMPLETED',output:execution,error:null,completedAt:new Date()}});
       await prisma.aiPendingAgentAction.updateMany({where:{taskId:current.id,ispId},data:{status:'COMPLETED',error:null}}).catch(()=>{});
       await prisma.aiAgentAction.updateMany({where:{taskId:current.id,agentId:agent.id},data:{output:{verified:execution.verified,nas:execution.nas,radius:execution.radius,router:execution.router},executedAt:new Date()}});
-      await prisma.aiAgentActivityLog.create({data:{ispId,agentId:agent.id,userId:user?.id||current.requestedBy,eventType:'TASK_COMPLETED',description:execution.summary,metadata:{taskId:current.id,stage:'REPORT',verified:execution.verified}}});
+      await reportTaskCompletion(prisma, { taskId: current.id, ispId, agentId: agent.id, userId: user?.id || current.requestedBy, summary: execution.summary, result: execution, ticketId });
       await finalizeTaskLinks({prisma,ispId,task:current,status:'COMPLETED',summary:execution.summary});
       return;
     }
     if(current.taskType==='NAS_UPDATE'){
+      if (ticketId) await writeAgentComment(prisma, { ticketId, agentId: agent.id, ispId, content: 'Starting NAS update workflow...', commentType: 'PROGRESS' });
       const execution=await executeNasUpdateTask({prisma,ispId,user,agent,task:current});
       await prisma.aiAgentTask.update({where:{id:current.id},data:{status:'COMPLETED',output:execution,error:null,completedAt:new Date()}});
       await prisma.aiPendingAgentAction.updateMany({where:{taskId:current.id,ispId},data:{status:'COMPLETED',error:null}}).catch(()=>{});
       await prisma.aiAgentAction.updateMany({where:{taskId:current.id,agentId:agent.id},data:{output:{verified:execution.verified,nas:execution.nas,radius:execution.radius,router:execution.router},executedAt:new Date()}});
-      await prisma.aiAgentActivityLog.create({data:{ispId,agentId:agent.id,userId:user?.id||current.requestedBy,eventType:'TASK_COMPLETED',description:execution.summary,metadata:{taskId:current.id,stage:'REPORT',verified:execution.verified}}});
+      await reportTaskCompletion(prisma, { taskId: current.id, ispId, agentId: agent.id, userId: user?.id || current.requestedBy, summary: execution.summary, result: execution, ticketId });
       return;
     }
     await recordStage(prisma,{ispId,agentId:agent.id,userId:user?.id||current.requestedBy,taskId:current.id,stage:'ANALYZE',description:'The assigned specialist is analyzing the request and available records.'});
-    let operation=null;if(current.taskType==='CUSTOMER_DIAGNOSTIC')operation=await executeOperation({prisma,ispId,user,message:`${current.title}. ${current.description||''}`,contextMessage:`${current.title}. ${current.description||''}`});
+
+    // Check if user provided replies for previously waiting tasks
+    const userReplies = current.input?.userReplies || [];
+    const taskDescription = userReplies.length > 0
+      ? `${current.title}. ${current.description || ''}\n\nAdditional context from user:\n${userReplies.map(r => r.content).join('\n')}`
+      : `${current.title}. ${current.description || ''}`;
+
+    let operation=null;if(current.taskType==='CUSTOMER_DIAGNOSTIC')operation=await executeOperation({prisma,ispId,user,message:taskDescription,contextMessage:taskDescription});
     const [runtimeTools,runtimePermissions,runtimeKnowledge]=await Promise.all([prisma.aiAgentTool.findMany({where:{agentId:agent.id,enabled:true}}),prisma.aiAgentPermission.findMany({where:{agentId:agent.id}}),prisma.aiAgentKnowledgeSource.findMany({where:{agentId:agent.id,enabled:true}})]);
-    const provider=await getProvider({prisma,ispId});const context={kind:operation?'RECORDS':'TASK',records:{task:{id:current.id,title:current.title,description:current.description,taskType:current.taskType},...(operation?{operation}:{})},performed:operation?.performed||[]};
-    const result=await provider.complete({agent,message:`Complete this assigned task and report the verified outcome: ${current.title}. ${current.description||''}`,context,history:[],user,runtime:{tools:runtimeTools,permissions:runtimePermissions,knowledge:runtimeKnowledge}});
-    if(result.provider==='safe-fallback'&&!operation){throw Object.assign(new Error('I could not start this safely because no configured model or allowlisted executor supports this task yet.'),{code:'AI_TASK_BLOCKED'});}
+    const provider=await getProvider({prisma,ispId});const context={kind:operation?'RECORDS':'TASK',records:{task:{id:current.id,title:current.title,description:current.description,taskType:current.taskType,userReplies},...(operation?{operation}:{})},performed:operation?.performed||[]};
+
+    if (ticketId) await writeAgentComment(prisma, { ticketId, agentId: agent.id, ispId, content: 'Executing task with AI model...', commentType: 'PROGRESS' });
+
+    const result=await provider.complete({agent,message:`Complete this assigned task and report the verified outcome: ${taskDescription}`,context,history:[],user,runtime:{tools:runtimeTools,permissions:runtimePermissions,knowledge:runtimeKnowledge}});
+
+    // Check if the AI response indicates it needs more information
+    const needsMoreInfo = /\b(need|require|missing|please provide|cannot proceed|don't have|do not have)\b.*\b(information|details|credentials|password|ip address|access|input)\b/i.test(result.content);
+
+    if (needsMoreInfo && result.provider !== 'safe-fallback') {
+      // AI agent is asking for more information — enter WAITING_FOR_USER
+      await requestUserInput(prisma, {
+        taskId: current.id,
+        ispId,
+        agentId: agent.id,
+        userId: user?.id || current.requestedBy,
+        question: result.content,
+        ticketId
+      });
+      await logModelUsage(prisma, { ispId, agentId: agent.id, userId: user?.id, resolution: modelResolution, usage: result.usage, context: 'task' });
+      return;
+    }
+
+    if(result.provider==='safe-fallback'&&!operation){
+      // Report the failure with a suggestion instead of just throwing
+      await reportTaskFailure(prisma, {
+        taskId: current.id, ispId, agentId: agent.id,
+        userId: user?.id || current.requestedBy,
+        error: 'No configured AI model or allowlisted executor supports this task type yet.',
+        suggestion: 'Configure a Gemini or OpenAI API key in System Settings → AI Provider, or assign this task to a human operator.',
+        ticketId
+      });
+      throw Object.assign(new Error('I could not start this safely because no configured model or allowlisted executor supports this task yet.'),{code:'AI_TASK_BLOCKED'});
+    }
     const summary=result.content;
-    await prisma.aiAgentTask.update({where:{id:current.id},data:{status:'COMPLETED',output:{stage:'REPORT',summary,provider:result.provider,model:result.model,operation:operation||null,verified:Boolean(operation)},completedAt:new Date()}});
+    await prisma.aiAgentTask.update({where:{id:current.id},data:{status:'COMPLETED',output:{stage:'REPORT',summary,provider:result.provider,model:result.model,modelResolution,operation:operation||null,verified:Boolean(operation)},completedAt:new Date()}});
     await prisma.aiPendingAgentAction.updateMany({where:{taskId:current.id,ispId},data:{status:'COMPLETED',error:null}}).catch(()=>{});
-    await prisma.aiAgentActivityLog.create({data:{ispId,agentId:agent.id,userId:user?.id||current.requestedBy,eventType:'TASK_COMPLETED',description:`${current.title} completed`,metadata:{taskId:current.id,stage:'REPORT',provider:result.provider,operation:operation?.operation||null}}});
+    await reportTaskCompletion(prisma, { taskId: current.id, ispId, agentId: agent.id, userId: user?.id || current.requestedBy, summary, result: { provider: result.provider, model: result.model }, ticketId });
     await finalizeTaskLinks({prisma,ispId,task:current,status:'COMPLETED',summary});
+    await logModelUsage(prisma, { ispId, agentId: agent.id, userId: user?.id, resolution: modelResolution, usage: result.usage, context: 'task' });
   }catch(error){
     console.error('[AI task runner failed]',error);
     const status=error.code==='AI_TASK_BLOCKED'?'BLOCKED':'FAILED';const message=cleanText(error.message||'The task could not be completed.',5000);
     await prisma.aiAgentTask.updateMany({where:{id:task.id,ispId},data:{status,error:message,output:{stage:status==='BLOCKED'?'APPROVE':'REPORT',summary:message,partialResult:error.partialResult||null},completedAt:new Date()}}).catch(()=>{});
     await prisma.aiPendingAgentAction.updateMany({where:{taskId:task.id,ispId},data:{status:'FAILED',error:message}}).catch(()=>{});
-    await prisma.aiAgentActivityLog.create({data:{ispId,agentId:agent.id,userId:user?.id||task.requestedBy,eventType:status==='BLOCKED'?'TASK_BLOCKED':'TASK_FAILED',description:message,metadata:{taskId:task.id,stage:status==='BLOCKED'?'APPROVE':'REPORT',partialResult:error.partialResult||null}}}).catch(()=>{});
+    // Report failure to ticket with human-readable error
+    await reportTaskFailure(prisma, {
+      taskId: task.id, ispId, agentId: agent.id,
+      userId: user?.id || task.requestedBy,
+      error: message,
+      suggestion: status === 'BLOCKED' ? 'Configure an AI provider or approve this task for manual execution.' : 'Check the error details and retry, or assign to a human operator.',
+      ticketId
+    }).catch(() => {});
     await finalizeTaskLinks({prisma,ispId,task,status,summary:message}).catch(()=>{});
   }
 }
@@ -304,6 +377,7 @@ async function processQueuedTasks(prisma){
   if(workerBusy)return;
   workerBusy=true;
   try{
+    // Process pending tasks
     const tasks=await prisma.aiAgentTask.findMany({where:{status:'PENDING'},orderBy:{createdAt:'asc'},take:10});
     for(const task of tasks){
       const sensitive=/NAS|RADIUS|MIKROTIK|ROUTER|SSH|CONFIG|PROVISION|HARDWARE/.test(task.taskType);
@@ -311,6 +385,22 @@ async function processQueuedTasks(prisma){
       const [agent,user]=await Promise.all([prisma.aiAgent.findFirst({where:{id:task.agentId,ispId:task.ispId,status:'ACTIVE'}}),prisma.user.findFirst({where:{id:task.requestedBy,ispId:task.ispId,isDeleted:false}})]);
       if(!agent)continue;
       await runQueuedTask({prisma,ispId:task.ispId,user:user||{id:task.requestedBy},agent,task});
+    }
+
+    // Process tasks waiting for user input (human-in-the-loop polling)
+    const resumedIds = await processWaitingTaskComms(prisma);
+    for (const taskId of resumedIds) {
+      const resumedTask = await prisma.aiAgentTask.findFirst({ where: { id: taskId, status: 'ANALYZING' } });
+      if (!resumedTask) continue;
+      const [agent, user] = await Promise.all([
+        prisma.aiAgent.findFirst({ where: { id: resumedTask.agentId, ispId: resumedTask.ispId, status: 'ACTIVE' } }),
+        prisma.user.findFirst({ where: { id: resumedTask.requestedBy, ispId: resumedTask.ispId, isDeleted: false } })
+      ]);
+      if (agent) {
+        // Re-queue the resumed task as PENDING so it gets picked up
+        await prisma.aiAgentTask.update({ where: { id: taskId }, data: { status: 'PENDING' } });
+        await runQueuedTask({ prisma, ispId: resumedTask.ispId, user: user || { id: resumedTask.requestedBy }, agent, task: { ...resumedTask, status: 'PENDING' } });
+      }
     }
   }catch(error){console.error('[AI task worker]',error);}finally{workerBusy=false;}
 }

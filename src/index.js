@@ -9,8 +9,11 @@ const path = require('path');
 const cookieParser = require('cookie-parser');
 const WebSocketManager = require('./lib/websocket.js'); // Your WebSocketManager class
 const YeastarService = require('./services/yeaster.service');
+const whatsappService = require('./services/whatsapp.service');
+const databaseBackupService = require('./services/database-backup.service');
 const { licenseGuard } = require('./services/license.service');
 const { errorHandler } = require('./middlewares/errorHandler');
+const requestLogger = require('./middlewares/requestLogger');
 
 require('dotenv').config();
 // Trigger nodemon reload
@@ -74,6 +77,7 @@ const managedDeviceStatus = new DeviceStatusService(prisma, managedDeviceConnect
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+app.use(requestLogger(prisma));
 app.use(taskLogger());
 app.use(calendarDateSupport());
 app.use('/uploads', express.static(path.join(__dirname, '../../uploads')));
@@ -246,6 +250,23 @@ app.use('/api/themes', themeRouter(prisma));
 app.use('/api/devices', managedDeviceRouter(prisma));
 app.use('/api/network-operations', require('./routes/network-operations.routes')(prisma));
 
+app.use('/resellers', require('./routes/reseller.routes')(prisma));
+app.use('/api/resellers', require('./routes/reseller.routes')(prisma));
+
+app.use('/wallets', require('./routes/wallet.routes')(prisma));
+app.use('/api/wallets', require('./routes/wallet.routes')(prisma));
+
+app.use('/gps', require('./routes/gps.routes')(prisma));
+app.use('/api/gps', require('./routes/gps.routes')(prisma));
+
+app.use('/accounting', require('./routes/accounting.routes')(prisma));
+app.use('/api/accounting', require('./routes/accounting.routes')(prisma));
+
+app.use('/api-tokens', require('./routes/apiToken.routes')(prisma));
+app.use('/api/api-tokens', require('./routes/apiToken.routes')(prisma));
+app.use('/api/v1', require('./routes/externalApi.routes')(prisma));
+
+
 
 // Error handling middleware (must remain after all routes).
 app.use(errorHandler);
@@ -287,6 +308,14 @@ server.listen(PORT, '0.0.0.0', () => {
         console.error('[YEASTAR] Failed to auto-start listeners:', error.message);
     });
 
+    // LocalAuth credentials survive process restarts. Recreate QR-provider clients
+    // automatically unless an administrator intentionally disconnected the session.
+    whatsappService.initializePersistedSessions().catch((error) => {
+        console.error('[WhatsApp Service] Failed to restore persisted sessions:', error.message);
+    });
+
+    databaseBackupService.startScheduler();
+
     // Resume approved and non-sensitive AI work even after a server restart.
     require('./controllers/ai-agent.controller').startTaskWorker(prisma);
 
@@ -301,6 +330,7 @@ server.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', async () => {
     console.log('Shutting down server...');
     managedDeviceStatus.stop();
+    databaseBackupService.stopScheduler();
     if (webSocketManager.shutdown) {
         webSocketManager.shutdown();
     }
@@ -314,6 +344,7 @@ process.on('beforeExit', async () => {
 process.on('SIGINT', async () => {
     console.log('Shutting down server...');
     managedDeviceStatus.stop();
+    databaseBackupService.stopScheduler();
     if (webSocketManager.shutdown) webSocketManager.shutdown();
     process.exit(0);
 });

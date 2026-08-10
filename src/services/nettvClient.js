@@ -341,7 +341,28 @@ class NetTVClient {
             throw new Error(`Missing required fields: ${missingFields.join(', ')}`);
         }
 
-        return this.#apiRequest('post', '/subscribers', subscriberData);
+        const payload = {
+            has_ratv: 1,
+            status: 1,
+            ...subscriberData
+        };
+
+        const result = await this.#apiRequest('post', '/subscribers', payload);
+
+        const subscriberId = result?.data?.id || result?.id || result?.subscriber?.id;
+        if (subscriberId) {
+            await this.addSubscriberGroup(subscriberId, 6).catch(err => {
+                console.warn('[NETTV] Failed to add subscriber group 6:', err.message);
+            });
+        }
+
+        return result;
+    }
+
+    async addSubscriberGroup(subscriberId, groupId = 6, resellerId = null) {
+        const rId = resellerId || this.#config.resellerId || 2946;
+        const endpoint = `/reseller/subscriber/v2/namespace/${rId}/subscribers/${subscriberId}/subscriber-groups`;
+        return this.#apiRequest('post', endpoint, { subscriber_group_id: Number(groupId) });
     }
 
 

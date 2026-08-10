@@ -65,7 +65,13 @@ class HuaweiOltAdapter extends BaseDeviceAdapter{
   const gpon=(boards.view?.items||[]).filter(row=>/GP|PON/i.test(String(row.boardName||''))).map(row=>Number(row.slot)).filter(Number.isInteger);
   const slots=[...new Set(gpon.length?gpon:[0])].slice(0,18);
   const execution=await this.connections.withConnection(this.device,async(connection,method)=>{
-   if(method!=='SSH')throw Object.assign(new Error('Huawei PON port discovery currently requires SSH.'),{code:'DEVICE_PROTOCOL_UNSUPPORTED',status:400});
+   if(method!=='SSH'){
+    const sshPort=Number(this.device.connectionProfile?.sshPort||this.device.managementPort||22);
+    const preferredProtocol=String(this.device.preferredProtocol||'AUTO').toUpperCase();
+    const fallbacks=Array.isArray(this.device.fallbackProtocols)?this.device.fallbackProtocols.map(String).map(p=>p.toUpperCase()):[];
+    const canUseSsh=preferredProtocol==='SSH'||preferredProtocol==='AUTO'||fallbacks.includes('SSH');
+    throw Object.assign(new Error(`Huawei OLT PON port discovery requires SSH protocol. Current: ${method}. Configured: ${preferredProtocol}. Device SSH available at ${this.device.host}:${sshPort}. ${canUseSsh?'SSH is available - check device connectivity.':'SSH not configured - update device connection profile to use SSH or AUTO mode.'}`),{code:'DEVICE_PROTOCOL_UNSUPPORTED',status:400,device:this.device.id,protocol:method,required:'SSH'});
+   }
    return connection.runShellSession(async send=>{
     const outputs=[];
     await send('config');

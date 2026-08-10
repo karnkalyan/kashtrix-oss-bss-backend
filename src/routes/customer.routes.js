@@ -65,6 +65,32 @@ module.exports = (prisma) => {
 
   // Apply isAuthenticated globally for customer routes
   router.use(isAuthenticated(prisma));
+  const restrictResellerCustomer = async (req, res, next, rawId) => {
+    try {
+      if (!req.user?.resellerId) return next();
+      const customer = await prisma.customer.findFirst({
+        where: {
+          id: Number(rawId),
+          ispId: Number(req.ispId),
+          resellerId: Number(req.user.resellerId),
+          isDeleted: false
+        },
+        select: { id: true }
+      });
+      if (!customer) return res.status(404).json({ error: 'Customer not found' });
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+  router.param('id', restrictResellerCustomer);
+  router.param('customerId', restrictResellerCustomer);
+  const denyResellerBroadNetworkAction = (req, res, next) => {
+    if (req.user?.resellerId) {
+      return res.status(403).json({ error: 'Use a customer-specific action for an assigned customer' });
+    }
+    return next();
+  };
 
   router.get('/profile', getCustomerProfile);
   router.post('/profile/photo', handleFileUpload, uploadCustomerProfilePhoto);
@@ -129,14 +155,14 @@ module.exports = (prisma) => {
   );
   // Disconnect & Sessions Features must be declared before /:id.
   router.get('/nas-devices', checkPermission('nas_read'), listNasDevices);
-  router.get('/sessions', checkPermission('customer_read'), listActiveSessions);
-  router.get('/sessions/:username', checkPermission('customer_read'), getSessionInfoForUser);
-  router.post('/disconnect/branch/:branchId/all', checkPermission('customer_update'), disconnectBranchSessions);
-  router.post('/disconnect/pool/:poolValue/all', checkPermission('customer_update'), disconnectPoolSessions);
-  router.post('/disconnect/filter/customers', checkPermission('customer_update'), disconnectFilteredCustomerSessions);
-  router.post('/disconnect/session/:sessionId', checkPermission('customer_update'), disconnectBySessionId);
-  router.post('/disconnect/:username/all', checkPermission('customer_update'), disconnectAllSessions);
-  router.post('/disconnect/:username', checkPermission('customer_update'), disconnectLatestSession);
+  router.get('/sessions', checkPermission('customer_read'), denyResellerBroadNetworkAction, listActiveSessions);
+  router.get('/sessions/:username', checkPermission('customer_read'), denyResellerBroadNetworkAction, getSessionInfoForUser);
+  router.post('/disconnect/branch/:branchId/all', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectBranchSessions);
+  router.post('/disconnect/pool/:poolValue/all', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectPoolSessions);
+  router.post('/disconnect/filter/customers', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectFilteredCustomerSessions);
+  router.post('/disconnect/session/:sessionId', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectBySessionId);
+  router.post('/disconnect/:username/all', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectAllSessions);
+  router.post('/disconnect/:username', checkPermission('customer_update'), denyResellerBroadNetworkAction, disconnectLatestSession);
   router.get('/:id', checkPermission('customer_read'), getCustomerById);
   router.get('/:id/radius/auth-logs', checkPermission('customer_read'), getCustomerRadiusAuthLogs);
   router.put('/:id/radius/bind-mac', checkPermission('customer_update'), bindCustomerRadiusMac);

@@ -25,7 +25,13 @@ async function establishSSHConnection() {
   }
 
   try {
-    await ssh.connect({ host: '10.64.0.100', username: 'technicalhakim', password: 'hakim@1135' });
+    const host = process.env.OLT_IP || '10.64.0.100';
+    const username = process.env.OLT_USER || 'technicalhakim';
+    const password = process.env.OLT_PASS;
+    if (!password) {
+      throw new Error('OLT_PASS is not configured in environment variables');
+    }
+    await ssh.connect({ host, username, password });
     const client = ssh.connection;
 
     client.on('error', err => {

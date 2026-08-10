@@ -1,72 +1,30 @@
 version: "3.9"
 
 services:
-  db:
-    image: mysql:8.0
-    container_name: kisan-mysql
-    restart: unless-stopped
-
-    command:
-      - --default-authentication-plugin=mysql_native_password
-
-    environment:
-      MYSQL_ROOT_PASSWORD: "!sP!ssw0rd#!2323#$"
-      MYSQL_DATABASE: "radius_manager"
-
-    ports:
-      - "3307:3306" # host access only, internal still 3306
-
-    volumes:
-      - mysql_data:/var/lib/mysql
-
-    healthcheck:
-      test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD" ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-    networks:
-      - app-network
-
   api:
     build:
       context: .
       dockerfile: Dockerfile
 
-    container_name: kisan-api
+    container_name: kashtrix-api
     restart: unless-stopped
+
     command: sh -c "npm run dockerStartup && npm start"
 
-    depends_on:
-      db:
-        condition: service_healthy
-
     ports:
-      - "3200:3200"
+      - "127.0.0.1:3200:3200"
 
     volumes:
       - ./uploads:/app/uploads
 
-    environment:
-      NODE_ENV: production
-      PORT: 3200
+    env_file:
+      - /etc/kashtrix/secrets/backend.env
 
-      # IMPORTANT: must match DB password exactly (URL encoded)
-      DATABASE_URL: "mysql://root:%21sP%21ssw0rd%23%212323%23%24@db:3306/radius_manager"
-
-      ACCESS_SECRET: "IspMainAdminPanel123@!23"
-      REFRESH_SECRET: "ispMainAdminPanelRefresh123"
-      LICENSE_HARDWARE_ID: ""
-      LICENSE_GENERATOR_SECRET: "Kasvian@123Kalyan!@#"
-      LICENSE_SECRET: "Kasvian@123Kalyan!@#"
-
-      GOOGLE_CLIENT_ID: "497249566156-jed3q4fsm8ndrip7sdopqtk9gp5rh0eh.apps.googleusercontent.com"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     networks:
       - app-network
-
-volumes:
-  mysql_data:
 
 networks:
   app-network:

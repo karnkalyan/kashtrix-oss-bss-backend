@@ -44,19 +44,36 @@ module.exports = (prisma) => {
   });
 
   router.use(isAuthenticated(prisma));
+  router.param('id', async (req, res, next, rawId) => {
+    try {
+      if (!req.user?.resellerId) return next();
+      const lead = await prisma.lead.findFirst({
+        where: {
+          id: Number(rawId),
+          ispId: Number(req.ispId),
+          resellerId: Number(req.user.resellerId),
+          isDeleted: false
+        },
+        select: { id: true }
+      });
+      if (!lead) return res.status(404).json({ error: 'Lead not found' });
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
 
   // CRUD endpoints
   router.post('/', checkPermission('lead_create'), createLead);
   router.get('/template', checkPermission('lead_read'), downloadCSVTemplate);
   router.get('/', checkAnyPermission(['lead_read', 'tasks_read_self', 'tasks_update']), getAllLeads);
   router.get('/converted', checkPermission('lead_read'), getConvertedLeads);
+  router.get('/reports/data', checkPermission('lead_read'), getLeadReports);
+  router.get('/reports/export', checkPermission('lead_read'), exportLeadReport);
   router.get('/:id', checkPermission('lead_read'), getLeadById);
   router.put('/:id', checkPermission('lead_update'), updateLead);
   router.delete('/:id', checkPermission('lead_delete'), deleteLead);
   router.post('/:id/convert', checkPermission('customer_create'), convertLeadToCustomer);
-  router.get('/reports/data', checkPermission('lead_read'), getLeadReports);
-  router.get('/reports/export', checkPermission('lead_read'), exportLeadReport);
-
   // Bulk import endpoint
   router.post('/import',
     checkPermission('lead_create'),

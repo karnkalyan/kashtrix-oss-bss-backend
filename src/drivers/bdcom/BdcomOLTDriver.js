@@ -1,6 +1,7 @@
 const SSHSession = require('../../core/ssh/SSHSession');
 const TelnetSession = require('../../core/telnet/TelnetSession');
 const prisma = require('../../../prisma/client');
+const { normalizeMac } = require('../../utils/macAddress');
 
 class BdcomOLTDriver {
     constructor(device) {
@@ -63,6 +64,90 @@ class BdcomOLTDriver {
                 await send('end').catch(() => { });
             }
         });
+    }
+
+    // --- MAC to F/S/P LOOKUP ---
+
+    /**
+     * Convert any MAC address format to BDCOM format: xxxx.xxxx.xxxx
+     */
+    static normalizeMAC(mac) {
+        return normalizeMac(mac, 'dotted');
+    }
+
+    /**
+     * Find interface/port from a MAC address on this OLT.
+     * Runs: show mac address-table | include <mac>
+     * Returns array of matches
+     */
+    async findFSPByMac(mac) {
+        const bdcomMac = BdcomOLTDriver.normalizeMAC(mac);
+
+        return this.runSession(async (send) => {
+            const raw = await send(`show mac address-table | include ${bdcomMac}`);
+            return this.parseMacAddressTable(raw, bdcomMac);
+        });
+    }
+
+    /**
+     * Parse BDCOM MAC address table output.
+     * BDCOM format varies but commonly:
+     * VLAN    MAC Address       Type      Ports
+     * ----    -----------       ----      -----
+     * 100     0011.2233.4455    DYNAMIC   EPON0/1:2
+     */
+    parseMacAddressTable(text, filterMac = null) {
+        const results = [];
+        const lines = text
+            .replace(/\r/g, '')
+            .split('\n')
+            .filter(l => l.trim() && !l.includes('---') && !l.includes('VLAN') && !l.includes('Mac Address'));
+
+        for (const line of lines) {
+            // Match: VLAN  MAC  Type  Port
+            const m = line.match(
+                /^\s*(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+(\w+)\s+(\S+)/
+            );
+            if (!m) continue;
+
+            const macAddr = m[2].toLowerCase();
+            if (filterMac && macAddr !== filterMac.toLowerCase()) continue;
+
+            const portStr = m[4];
+            // Parse EPON0/1:2 or GE0/1 style port identifiers
+            let frame = 0, slot = 0, port = 0, ontId = null;
+            const eponMatch = portStr.match(/(?:EPON|GPON)(\d+)\/(\d+)(?::(\d+))?/i);
+            const geMatch = portStr.match(/(?:GE|XGE)(\d+)\/(\d+)/i);
+
+            if (eponMatch) {
+                frame = parseInt(eponMatch[1]);
+                slot = 0;
+                port = parseInt(eponMatch[2]);
+                ontId = eponMatch[3] ? parseInt(eponMatch[3]) : null;
+            } else if (geMatch) {
+                frame = parseInt(geMatch[1]);
+                port = parseInt(geMatch[2]);
+            }
+
+            results.push({
+                originalMac: filterMac || macAddr,
+                normalizedMac: macAddr,
+                macAddress: macAddr,
+                vlan: parseInt(m[1]),
+                macType: m[3],
+                interface: portStr,
+                interfaceType: portStr.replace(/[0-9/:].*$/, ''),
+                frame,
+                slot,
+                port,
+                ontId,
+                fsp: `${frame}/${slot}/${port}`,
+                rawMatchedLine: line.trim(),
+                lookupTimestamp: new Date().toISOString()
+            });
+        }
+
+        return results;
     }
 
     // --- HIGH LEVEL ACTIONS ---

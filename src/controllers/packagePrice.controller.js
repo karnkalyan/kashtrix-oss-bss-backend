@@ -178,13 +178,33 @@ async function createPackagePrice(req, res, next) {
   }
 }
 
+async function getScopedPackagePlanIds(req) {
+  if (req.user?.resellerId) {
+    const links = await req.prisma.packagePlanReseller.findMany({
+      where: { resellerId: Number(req.user.resellerId) },
+      select: { packagePlanId: true }
+    });
+    return links.map(link => link.packagePlanId);
+  }
+  if (req.branchId) {
+    const links = await req.prisma.PackagePlanBranch.findMany({
+      where: { branchId: Number(req.branchId) },
+      select: { packagePlanId: true }
+    });
+    return links.map(link => link.packagePlanId);
+  }
+  return null;
+}
+
 // List package prices without one-time charges
 async function listPackagePrices(req, res, next) {
   try {
+    const scopedPlanIds = await getScopedPackagePlanIds(req);
     const list = await req.prisma.PackagePrice.findMany({
       where: {
         isDeleted: false,
         ispId: req.ispId,
+        ...(scopedPlanIds ? { planId: { in: scopedPlanIds } } : {}),
         ...(req.query.online === 'true' ? { isOnline: true, isActive: true } : {}),
         ...(req.query.active === 'true' ? { isActive: true } : {})
       },
@@ -238,8 +258,14 @@ async function getPackagePriceById(req, res, next) {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: 'Invalid ID' });
 
-    const item = await req.prisma.PackagePrice.findUnique({
-      where: { id },
+    const scopedPlanIds = await getScopedPackagePlanIds(req);
+    const item = await req.prisma.PackagePrice.findFirst({
+      where: {
+        id,
+        ispId: req.ispId,
+        isDeleted: false,
+        ...(scopedPlanIds ? { planId: { in: scopedPlanIds } } : {})
+      },
       select: {
         id: true,
         price: true,
@@ -253,6 +279,7 @@ async function getPackagePriceById(req, res, next) {
         planId: true,
         referenceId: true,
         isTrial: true,
+        addonPricesJson: true,
         packagePlanDetails: { select: { planName: true, downSpeed: true, upSpeed: true } }
       }
     });

@@ -1,9 +1,18 @@
+const whatsappService = require('../services/whatsapp.service');
+const databaseBackupService = require('../services/database-backup.service');
+
 /**
  * Get all ISP settings
  */
 function isSystemAdmin(req) {
-    const role = String(req.user?.role || '').toLowerCase();
-    return role === 'administrator' || role === 'admin' || role.startsWith('global ');
+    const role = String(typeof req.user?.role === 'object' ? req.user.role?.name : req.user?.role || '').toLowerCase();
+    return role === 'administrator' || role === 'admin' || role === 'super admin' || role === 'super_admin' || role.startsWith('global');
+}
+
+function canManageDatabaseBackups(req) {
+    // A full SQL dump contains every tenant, so ISP-scoped admins must not access it.
+    const role = String(typeof req.user?.role === 'object' ? req.user.role?.name : req.user?.role || '').trim().toLowerCase();
+    return ['administrator', 'admin', 'super admin', 'super_admin'].includes(role) || role.startsWith('global');
 }
 
 const SENSITIVE_SETTING_KEYS = new Set([
@@ -62,7 +71,7 @@ function normalizeSettingsInput(settings = []) {
 async function getSettings(req, res, next) {
     try {
         const ispId = req.ispId;
-        const settings = await req.prisma.ISPSettings.findMany({
+        const settings = await req.prisma.iSPSettings.findMany({
             where: { ispId }
         });
 
@@ -80,7 +89,7 @@ async function getSettings(req, res, next) {
 
 async function getCalendarSystem(req, res, next) {
     try {
-        const setting = await req.prisma.ISPSettings.findFirst({
+        const setting = await req.prisma.iSPSettings.findFirst({
             where: { ispId: req.ispId, key: 'defaultCalendarSystem' },
             select: { value: true }
         });
@@ -108,7 +117,7 @@ async function updateSetting(req, res, next) {
         }
 
         const operations = normalizedSettings.map(setting =>
-            req.prisma.ISPSettings.upsert({
+            req.prisma.iSPSettings.upsert({
                 where: { key: setting.key },
                 update: { value: setting.value, description: setting.description, updatedAt: new Date() },
                 create: { key: setting.key, value: setting.value, description: setting.description, ispId, updatedAt: new Date() }
@@ -136,7 +145,7 @@ async function batchUpdateSettings(req, res, next) {
         const normalizedSettings = normalizeSettingsInput(Array.isArray(settings) ? settings : []);
 
         const operations = normalizedSettings.map(s =>
-            req.prisma.ISPSettings.upsert({
+            req.prisma.iSPSettings.upsert({
                 where: { key: s.key }, // Note: key must be unique per ISP if we want this simple, or scoped
                 update: { value: String(s.value), description: s.description, updatedAt: new Date() },
                 create: { key: s.key, value: String(s.value), description: s.description, ispId, updatedAt: new Date() }
@@ -269,7 +278,7 @@ function normalizePool(input) {
 }
 
 async function readRadiusPools(prisma, ispId) {
-    const setting = await prisma.ISPSettings.findUnique({ where: { key: RADIUS_POOLS_KEY(ispId) } });
+    const setting = await prisma.iSPSettings.findUnique({ where: { key: RADIUS_POOLS_KEY(ispId) } });
     if (!setting?.value) return [];
     try {
         const parsed = JSON.parse(setting.value);
@@ -281,7 +290,7 @@ async function readRadiusPools(prisma, ispId) {
 
 async function writeRadiusPools(prisma, ispId, pools) {
     const value = JSON.stringify(pools.map(normalizePool).filter(Boolean));
-    return prisma.ISPSettings.upsert({
+    return prisma.iSPSettings.upsert({
         where: { key: RADIUS_POOLS_KEY(ispId) },
         update: { value, description: 'RADIUS framed pool values', updatedAt: new Date() },
         create: { key: RADIUS_POOLS_KEY(ispId), value, description: 'RADIUS framed pool values', ispId, updatedAt: new Date() }
@@ -330,6 +339,136 @@ async function deleteRadiusPool(req, res, next) {
     }
 }
 
+async function getWhatsAppSettings(req, res, next) {
+    try {
+        const data = await whatsappService.getSettings(req.ispId);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+}
+
+async function updateWhatsAppSettings(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) {
+            return res.status(403).json({ error: 'Only system administrators can update WhatsApp configurations.' });
+        }
+        const data = await whatsappService.updateSettings(req.ispId, req.body);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+}
+
+async function generateWhatsAppQr(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) {
+            return res.status(403).json({ error: 'Only system administrators can manage WhatsApp sessions.' });
+        }
+        const data = await whatsappService.generateQrSession(req.ispId);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+}
+
+async function disconnectWhatsAppQr(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) {
+            return res.status(403).json({ error: 'Only system administrators can manage WhatsApp sessions.' });
+        }
+        const data = await whatsappService.disconnectQrSession(req.ispId);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+}
+
+async function simulateWhatsAppQrScan(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) {
+            return res.status(403).json({ error: 'Only system administrators can manage WhatsApp sessions.' });
+        }
+        const data = await whatsappService.simulateQrScan(req.ispId);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+}
+
+async function listWhatsAppChats(req, res, next) {
+    try {
+        res.json(await whatsappService.listConversations(req.ispId));
+    } catch (err) { next(err); }
+}
+
+async function getWhatsAppChatMessages(req, res, next) {
+    try {
+        res.json(await whatsappService.getConversationMessages(req.ispId, req.params.phone));
+    } catch (err) { next(err); }
+}
+
+async function sendWhatsAppChatMessage(req, res, next) {
+    try {
+        const data = await whatsappService.sendChatMessage(req.ispId, req.params.phone, req.body?.body, req.user?.id);
+        res.json(data);
+    } catch (err) { next(err); }
+}
+
+async function listWhatsAppAutomationRules(req, res, next) {
+    try {
+        res.json(await whatsappService.listAutomationRules(req.ispId));
+    } catch (err) { next(err); }
+}
+
+async function saveWhatsAppAutomationRule(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only system administrators can manage WhatsApp automation.' });
+        res.json(await whatsappService.saveAutomationRule(req.ispId, req.body));
+    } catch (err) { next(err); }
+}
+
+async function deleteWhatsAppAutomationRule(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only system administrators can manage WhatsApp automation.' });
+        res.json(await whatsappService.deleteAutomationRule(req.ispId, req.params.id));
+    } catch (err) { next(err); }
+}
+
+async function getDatabaseBackupSettings(req, res, next) {
+    try {
+        if (!canManageDatabaseBackups(req)) {
+            return res.status(403).json({ error: 'Only system administrators can access full database backups.' });
+        }
+        res.json(await databaseBackupService.getConfig(req.ispId));
+    } catch (err) { next(err); }
+}
+
+async function updateDatabaseBackupSettings(req, res, next) {
+    try {
+        if (!canManageDatabaseBackups(req)) {
+            return res.status(403).json({ error: 'Only system administrators can configure full database backups.' });
+        }
+        res.json(await databaseBackupService.saveConfig(req.ispId, req.body));
+    } catch (err) {
+        if (/valid|must|between|required/i.test(err.message)) return res.status(400).json({ error: err.message });
+        next(err);
+    }
+}
+
+async function runDatabaseBackupNow(req, res, next) {
+    try {
+        if (!canManageDatabaseBackups(req)) {
+            return res.status(403).json({ error: 'Only system administrators can run full database backups.' });
+        }
+        const data = await databaseBackupService.runBackup(req.ispId, { trigger: 'manual' });
+        res.json({ success: true, message: 'Database backup created and emailed successfully.', data });
+    } catch (err) {
+        if (/already running|configure a valid/i.test(err.message)) return res.status(409).json({ error: err.message });
+        next(err);
+    }
+}
+
 module.exports = {
     getSettings,
     getCalendarSystem,
@@ -340,6 +479,20 @@ module.exports = {
     saveEsewaConfiguration,
     listRadiusPools,
     upsertRadiusPool,
-    deleteRadiusPool
+    deleteRadiusPool,
+    getWhatsAppSettings,
+    updateWhatsAppSettings,
+    generateWhatsAppQr,
+    disconnectWhatsAppQr,
+    simulateWhatsAppQrScan,
+    listWhatsAppChats,
+    getWhatsAppChatMessages,
+    sendWhatsAppChatMessage,
+    listWhatsAppAutomationRules,
+    saveWhatsAppAutomationRule,
+    deleteWhatsAppAutomationRule,
+    getDatabaseBackupSettings,
+    updateDatabaseBackupSettings,
+    runDatabaseBackupNow
 };
 const bcrypt = require('bcrypt');

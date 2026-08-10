@@ -32,11 +32,22 @@ const {
   getAvailablePorts,
   getOltLoadFiles,
   createOltLoadFile,
-  deleteOltLoadFile
+  deleteOltLoadFile,
+  findFSPByMac,
+  linkCustomerDeviceToOLT
 } = require('../controllers/olt.controller');
 
 const isAuthenticated = require('../middlewares/isAuthenticated');
 const checkPermission = require('../middlewares/checkPermission');
+const checkAnyPermission = require('../middlewares/checkAnyPermission');
+
+function requireAdministrator(req, res, next) {
+  const role = String(req.user?.role || '').toLowerCase();
+  if (!['administrator', 'admin', 'isp_admin', 'super admin', 'super_admin'].includes(role) || req.user?.resellerId) {
+    return res.status(403).json({ error: 'Only an ISP administrator can add OLTs' });
+  }
+  next();
+}
 
 module.exports = (prisma) => {
   const router = express.Router();
@@ -49,6 +60,24 @@ module.exports = (prisma) => {
 
   // Apply authentication middleware
   router.use(isAuthenticated(prisma));
+  router.param('id', async (req, res, next, rawId) => {
+    try {
+      if (!req.user?.resellerId) return next();
+      const olt = await prisma.oLT.findFirst({
+        where: {
+          id: Number(rawId),
+          ispId: Number(req.ispId),
+          resellerId: Number(req.user.resellerId),
+          isDeleted: false
+        },
+        select: { id: true }
+      });
+      if (!olt) return res.status(404).json({ error: 'OLT not found' });
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
   router.put('/:id/status', checkPermission('olt_update'), updateOltStatus);
 
   // OLT Management Routes
@@ -58,7 +87,7 @@ module.exports = (prisma) => {
   router.get('/vendors/:vendor/models', getModelsByVendor);
   router.get('/active-sessions', getActiveSessions);
 
-  router.post('/', checkPermission('olt_update'), createOlt);
+  router.post('/', requireAdministrator, checkPermission('olt_update'), createOlt);
   router.get('/:id', getOltById);
   router.put('/:id', checkPermission('olt_update'), updateOlt);
   router.delete('/:id', checkPermission('olt_update'), deleteOlt);
@@ -103,6 +132,10 @@ module.exports = (prisma) => {
 
   // Get available ports for VLAN/Profile assignment
   router.get('/:id/available-ports', checkPermission('olt_read'), getAvailablePorts);
+
+  // Find F/S/P from MAC address
+  router.post('/:id/find-fsp-by-mac', checkAnyPermission(['olt_mac_lookup', 'olt_read']), findFSPByMac);
+  router.post('/:id/link-customer-device', checkAnyPermission(['olt_customer_link', 'olt_update']), linkCustomerDeviceToOLT);
 
   return router;
 };

@@ -1,6 +1,7 @@
 const SSHSession = require('../../core/ssh/SSHSession');
 const TelnetSession = require('../../core/telnet/TelnetSession');
 const prisma = require('../../../prisma/client');
+const { normalizeMac } = require('../../utils/macAddress');
 
 class HuaweiOLTDriver {
     constructor(device) {
@@ -63,6 +64,78 @@ class HuaweiOLTDriver {
                 await send('return').catch(() => { });
             }
         });
+    }
+
+    // -------------------------
+    // MAC to F/S/P LOOKUP
+    // -------------------------
+
+    /**
+     * Convert any MAC address format to Huawei format: xxxx-xxxx-xxxx
+     * Accepts: AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF, AABB.CCDD.EEFF, AABBCCDDEEFF
+     */
+    static normalizeMAC(mac) {
+        return normalizeMac(mac, 'huawei');
+    }
+
+    /**
+     * Find Frame/Slot/Port from a MAC address on this OLT.
+     * Runs: display mac-address all | include <mac>
+     * Returns array of matches: [{ frame, slot, port, ontId, gemIndex, vlan, macAddress, portType }]
+     */
+    async findFSPByMac(mac) {
+        const huaweiMac = HuaweiOLTDriver.normalizeMAC(mac);
+
+        return this.runSession(async (send) => {
+            const raw = await send(`display mac-address all | include ${huaweiMac}`);
+            return this.parseMacAddressTable(raw, huaweiMac);
+        });
+    }
+
+    /**
+     * Parse Huawei MAC address table output.
+     * Expected columns: SRV-P INDEX, BUNDLE INDEX, TYPE, MAC, MAC TYPE, F/S/P, VPI, VCI, VLAN ID
+     */
+    parseMacAddressTable(text, filterMac = null) {
+        const results = [];
+        const lines = text
+            .replace(/\r/g, '')
+            .replace(/---- More.*?\n/g, '')
+            .split('\n')
+            .filter(l => l.trim() && !l.includes('---') && !l.includes('Note:') && !l.includes('SRV-P'));
+
+        for (const line of lines) {
+            // Match lines like: 12  -  gpon 784f-2462-fd2f dynamic  0 /5 /0   3    6   527
+            const m = line.match(
+                /^\s*(\d+)\s+(\S+)\s+(\w+)\s+([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\w+)\s+(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/
+            );
+            if (!m) continue;
+
+            const macAddr = m[4].toLowerCase();
+            if (filterMac && macAddr !== filterMac.toLowerCase()) continue;
+
+            results.push({
+                originalMac: filterMac || macAddr,
+                normalizedMac: macAddr,
+                macAddress: macAddr,
+                interfaceType: m[3],
+                portType: m[3],
+                macType: m[5],
+                frame: parseInt(m[6]),
+                slot: parseInt(m[7]),
+                port: parseInt(m[8]),
+                fsp: `${m[6]}/${m[7]}/${m[8]}`,
+                ontId: parseInt(m[9]),
+                gemIndex: parseInt(m[10]),
+                vlan: parseInt(m[11]),
+                servicePortIndex: parseInt(m[1]),
+                srvpIndex: parseInt(m[1]),
+                rawMatchedLine: line.trim(),
+                lookupTimestamp: new Date().toISOString()
+            });
+        }
+
+        return results;
     }
 
     // -------------------------

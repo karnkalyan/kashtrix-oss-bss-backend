@@ -2,6 +2,10 @@ const { ServiceFactory } = require('../lib/clients/ServiceFactory');
 const { SERVICE_CODES, SERVICE_CATEGORIES, DEFAULT_CREDENTIALS } = require('../lib/serviceConstants');
 const QRCode = require('qrcode');
 const { getCachedGenieACSResponse, setCachedGenieACSResponse, invalidateGenieACSResponseCache } = require('../lib/genieacsResponseCache');
+const { flattenParameters: flattenTR069Parameters, normalizeWanConnections } = require('../services/tr069-wan-adapter.service');
+const { normalizeLanConfiguration, buildLanParameterValues } = require('../services/tr069-lan-adapter.service');
+const { extractOltRxPower } = require('../utils/opticalPower');
+const { ponSerialCandidates } = require('../utils/ponSerial');
 
 const smsCampaignQueue = {
   processing: false,
@@ -32,10 +36,16 @@ function firstMeaningful(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '' && value !== 'N/A');
 }
 
+function isUsableWifiPassword(value) {
+  const password = String(value ?? '').trim();
+  return Boolean(password)
+    && !/^(?:N\/A|\[?MASKED\]?|REDACTED|\*{4,})$/i.test(password);
+}
+
 function extractWifiPassword(ssid) {
   const params = ssid?.parameters || {};
   const security = ssid?.security || {};
-  return firstMeaningful(
+  const candidates = [
     ssid?.keyPassphrase,
     ssid?.KeyPassphrase,
     ssid?.preSharedKey,
@@ -50,7 +60,33 @@ function extractWifiPassword(ssid) {
     params['InternetGatewayDevice.LANDevice.1.WLANConfiguration.5.PreSharedKey.1.KeyPassphrase'],
     params['Device.WiFi.AccessPoint.1.Security.KeyPassphrase'],
     params['Security.KeyPassphrase']
-  ) || '';
+  ];
+  return String(candidates.find(isUsableWifiPassword) || '');
+}
+
+function mergeWifiSnapshotPasswords(freshSsids = [], storedSsids = []) {
+  const storedByIdentity = new Map();
+  for (const ssid of Array.isArray(storedSsids) ? storedSsids : []) {
+    const index = getSsidIndexFromInstance(ssid.instance, ssid.ssidIndex || ssid.index);
+    const identities = [ssid.instance, `${ssid.source || ''}:${index}`, String(index)].filter(Boolean);
+    for (const identity of identities) storedByIdentity.set(String(identity), ssid);
+  }
+
+  return (Array.isArray(freshSsids) ? freshSsids : []).map((ssid) => {
+    const index = getSsidIndexFromInstance(ssid.instance, ssid.ssidIndex || ssid.index);
+    const stored = storedByIdentity.get(String(ssid.instance))
+      || storedByIdentity.get(`${ssid.source || ''}:${index}`)
+      || storedByIdentity.get(String(index));
+    const livePassword = extractWifiPassword(ssid);
+    const storedPassword = extractWifiPassword(stored);
+    const password = livePassword || storedPassword;
+    return {
+      ...ssid,
+      ssidIndex: index,
+      ...(password ? { keyPassphrase: password } : {}),
+      passwordSource: livePassword ? 'genieacs' : storedPassword ? 'database' : 'unavailable'
+    };
+  });
 }
 
 function escapeWifiQrValue(value) {
@@ -59,6 +95,113 @@ function escapeWifiQrValue(value) {
 
 function buildWifiQrPayload(ssidName, password) {
   return `WIFI:T:WPA;S:${escapeWifiQrValue(ssidName)};P:${escapeWifiQrValue(password)};;`;
+}
+
+function normalizeReportedSignal(value) {
+  const signal = Number(value);
+  return Number.isFinite(signal) && signal < 0 && signal >= -127 ? signal : null;
+}
+
+function mergeConnectedDeviceRecords(records = []) {
+  const byMac = new Map();
+  const meaningful = value => value !== undefined && value !== null && value !== '' && value !== 'N/A';
+  const usefulName = value => meaningful(value) && !/^unknown(?:[_ -]|$)/i.test(String(value));
+  const isIpv4 = value => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(value || ''));
+
+  for (const record of records) {
+    const mac = String(record?.macAddress || '').trim().toLowerCase();
+    if (!mac || mac === 'n/a') continue;
+
+    const incomingSignal = normalizeReportedSignal(record.signalStrength ?? record.rssi);
+    const incoming = { ...record, macAddress: mac, signalStrength: incomingSignal, rssi: incomingSignal };
+    const current = byMac.get(mac);
+    if (!current) {
+      byMac.set(mac, incoming);
+      continue;
+    }
+
+    const currentSignal = normalizeReportedSignal(current.signalStrength ?? current.rssi);
+    const incomingWifi = String(incoming.type || incoming.interfaceType).toLowerCase() === 'wifi';
+    const currentWifi = String(current.type || current.interfaceType).toLowerCase() === 'wifi';
+    const preferIncomingWifi = incomingWifi && (
+      !currentWifi ||
+      (incoming.authenticated === true && current.authenticated !== true) ||
+      (incomingSignal !== null && currentSignal === null)
+    );
+
+    const merged = preferIncomingWifi ? { ...current, ...incoming } : { ...incoming, ...current };
+    merged.macAddress = mac;
+    merged.hostName = usefulName(current.hostName)
+      ? current.hostName
+      : (usefulName(incoming.hostName) ? incoming.hostName : current.hostName || incoming.hostName || 'Unknown');
+    merged.ipAddress = isIpv4(current.ipAddress)
+      ? current.ipAddress
+      : (isIpv4(incoming.ipAddress) ? incoming.ipAddress : current.ipAddress || incoming.ipAddress || 'N/A');
+    merged.active = Boolean(current.active || incoming.active);
+    merged.signalStrength = preferIncomingWifi ? incomingSignal : (currentSignal ?? incomingSignal);
+    merged.rssi = merged.signalStrength;
+    if (incomingWifi || currentWifi) {
+      merged.type = 'WiFi';
+      merged.interfaceType = 'WiFi';
+    }
+    byMac.set(mac, merged);
+  }
+
+  return Array.from(byMac.values()).sort((a, b) => {
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    return String(a.hostName || '').localeCompare(String(b.hostName || ''));
+  });
+}
+
+function collectTR069ParameterMetadata(node, basePath = '', result = []) {
+  if (node === null || node === undefined) return result;
+  if (typeof node !== 'object' || Array.isArray(node)) {
+    if (basePath) {
+      result.push({
+        path: basePath,
+        value: node,
+        type: node === null ? 'null' : Array.isArray(node) ? 'array' : typeof node,
+        writable: false,
+        updatedAt: null,
+      });
+    }
+    return result;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(node, '_value')) {
+    const value = node._value;
+    result.push({
+      path: basePath,
+      value,
+      type: String(node._type || (value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value)).replace(/^xsd:/i, ''),
+      writable: node._writable === true,
+      updatedAt: node._timestamp || null,
+    });
+    return result;
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (key.startsWith('_')) continue;
+    collectTR069ParameterMetadata(value, basePath ? `${basePath}.${key}` : key, result);
+  }
+  return result;
+}
+
+function addRelativeParameterAliases(parameters, root) {
+  const result = { ...parameters };
+  const prefix = `${root}.`;
+  for (const [path, value] of Object.entries(parameters || {})) {
+    if (!path.startsWith(prefix)) continue;
+    const relativePath = path.slice(prefix.length);
+    if (!Object.prototype.hasOwnProperty.call(result, relativePath)) {
+      result[relativePath] = value;
+    }
+    const leafName = relativePath.split('.').pop();
+    if (leafName && !Object.prototype.hasOwnProperty.call(result, leafName)) {
+      result[leafName] = value;
+    }
+  }
+  return result;
 }
 
 class ServiceController {
@@ -196,6 +339,61 @@ class ServiceController {
         qrCodeDataUrl
       };
     }));
+  }
+
+  async patchStoredWifiSnapshot(ispId, serialNumber, {
+    ssidIndex,
+    instance,
+    ssidName,
+    password,
+    allPasswords = false
+  }) {
+    const device = await this.prisma.tr069Device.findFirst({
+      where: { ispId, serialNumber, isDeleted: false },
+      select: { id: true, wifiSnapshot: true }
+    });
+    if (!device) return;
+
+    const current = device.wifiSnapshot && typeof device.wifiSnapshot === 'object'
+      ? device.wifiSnapshot
+      : { success: true, data: { serialNumber, ssidList: [] } };
+    const currentList = Array.isArray(current?.data?.ssidList) ? current.data.ssidList : [];
+    const resolvedIndex = Number(ssidIndex || getSsidIndexFromInstance(instance, 1));
+    let matched = false;
+    const nextList = currentList.map((ssid) => {
+      const index = getSsidIndexFromInstance(ssid.instance, ssid.ssidIndex || ssid.index);
+      const applies = allPasswords || (instance && ssid.instance === instance) || index === resolvedIndex;
+      if (!applies) return ssid;
+      matched = true;
+      return {
+        ...ssid,
+        ssidIndex: index,
+        ...(ssidName ? { ssid: ssidName } : {}),
+        ...(isUsableWifiPassword(password) ? { keyPassphrase: String(password), passwordSource: 'database-update' } : {})
+      };
+    });
+    if (!matched && !allPasswords) {
+      nextList.push({
+        source: 'database',
+        instance: instance || `LANDevice.1.WLANConfiguration.${resolvedIndex}`,
+        ssidIndex: resolvedIndex,
+        ssid: ssidName || `SSID ${resolvedIndex}`,
+        ...(isUsableWifiPassword(password) ? { keyPassphrase: String(password), passwordSource: 'database-update' } : {}),
+        parameters: {}
+      });
+    }
+
+    const snapshotAt = new Date();
+    const snapshot = {
+      ...current,
+      success: true,
+      data: { ...(current.data || {}), serialNumber, ssidList: nextList },
+      meta: { ...(current.meta || {}), source: 'database-update', snapshotAt: snapshotAt.toISOString() }
+    };
+    await this.prisma.tr069Device.update({
+      where: { id: device.id },
+      data: { wifiSnapshot: snapshot, wifiSnapshotAt: snapshotAt, updatedAt: snapshotAt }
+    });
   }
 
   sendGenieACSError(res, error, fallbackError = 'GenieACS request failed') {
@@ -844,36 +1042,41 @@ class ServiceController {
           : (subscribersResponse.subscribers || subscribersResponse.data || subscribersResponse.items || []);
         
         if (Array.isArray(items) && items.length > 0) {
-          const usernames = items.map(sub => sub.username).filter(Boolean);
-          const nettvService = await db.service.findFirst({ where: { code: SERVICE_CODES.NETTV, isDeleted: false }, select: { id: true } });
-          const links = nettvService ? await db.customerSubscribedService.findMany({
-            where: { serviceId: nettvService.id, externalUsername: { in: usernames }, customer: { ispId, isDeleted: false } },
-            include: { customer: { include: { lead: true } } }
-          }) : [];
-          const linkedNames = new Set(links.map(link => link.externalUsername));
-          const legacyCustomers = await db.customer.findMany({
-            where: { customerUniqueId: { in: usernames.filter(name => !linkedNames.has(name)) }, ispId, isDeleted: false },
-            include: { lead: true }
-          });
-          
-          const customerMap = {};
-          const addCustomer = (username, cust) => {
-            customerMap[username] = {
-              id: cust.id,
-              customerUniqueId: cust.customerUniqueId,
-              status: cust.status,
-              firstName: cust.lead?.firstName || "",
-              lastName: cust.lead?.lastName || ""
+          try {
+            const usernames = items.map(sub => sub.username).filter(Boolean);
+            const nettvService = await db.service.findFirst({ where: { code: SERVICE_CODES.NETTV, isDeleted: false }, select: { id: true } });
+            const links = nettvService ? await db.customerSubscribedService.findMany({
+              where: { serviceId: nettvService.id, externalUsername: { in: usernames }, customer: { ispId, isDeleted: false } },
+              include: { customer: { include: { lead: true } } }
+            }) : [];
+            const linkedNames = new Set(links.map(link => link.externalUsername));
+            const legacyCustomers = await db.customer.findMany({
+              where: { customerUniqueId: { in: usernames.filter(name => !linkedNames.has(name)) }, ispId, isDeleted: false },
+              include: { lead: true }
+            });
+            
+            const customerMap = {};
+            const addCustomer = (username, cust) => {
+              customerMap[username] = {
+                id: cust.id,
+                customerUniqueId: cust.customerUniqueId,
+                status: cust.status,
+                firstName: cust.lead?.firstName || "",
+                lastName: cust.lead?.lastName || ""
+              };
             };
-          };
-          links.forEach(link => addCustomer(link.externalUsername, link.customer));
-          legacyCustomers.forEach(cust => addCustomer(cust.customerUniqueId, cust));
-          
-          items.forEach(sub => {
-            if (sub.username && customerMap[sub.username]) {
-              sub.local_customer = customerMap[sub.username];
-            }
-          });
+            links.forEach(link => addCustomer(link.externalUsername, link.customer));
+            legacyCustomers.forEach(cust => addCustomer(cust.customerUniqueId, cust));
+            
+            items.forEach(sub => {
+              if (sub.username && customerMap[sub.username]) {
+                sub.local_customer = customerMap[sub.username];
+              }
+            });
+          } catch (linkError) {
+            console.warn('[NetTV] Could not link subscribers to local customers:', linkError.message);
+            // Subscribers are still returned, just without local_customer data
+          }
         }
       }
 
@@ -1905,6 +2108,39 @@ class ServiceController {
     }
   }
 
+  async createRadiusTableRow(req, res) {
+    try {
+      const client = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, req.ispId);
+      const result = await client.createTableRow(req.params.table, req.body);
+      return res.status(201).json({ success: true, data: result });
+    } catch (error) {
+      console.error('Error creating Radius table row:', error);
+      return res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+  }
+
+  async updateRadiusTableRow(req, res) {
+    try {
+      const client = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, req.ispId);
+      const result = await client.updateTableRow(req.params.table, req.params.id, req.body);
+      return res.json({ success: true, data: result });
+    } catch (error) {
+      console.error('Error updating Radius table row:', error);
+      return res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+  }
+
+  async deleteRadiusTableRow(req, res) {
+    try {
+      const client = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, req.ispId);
+      const result = await client.deleteTableRow(req.params.table, req.params.id);
+      return res.json({ success: true, data: result });
+    } catch (error) {
+      console.error('Error deleting Radius table row:', error);
+      return res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+  }
+
   // Radius: Test authentication
   async testRadiusAuth(req, res) {
     try {
@@ -2764,12 +3000,18 @@ class ServiceController {
 
   async getGenieACSDeviceInfo(req, res) {
     try {
+      res.set('Cache-Control', 'no-store');
       const ispId = req.ispId;
       const { serialNumber } = req.params;
-      const cached = getCachedGenieACSResponse(ispId, serialNumber, 'deviceinfo');
+      const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+      const cached = shouldRefresh ? null : getCachedGenieACSResponse(ispId, serialNumber, 'deviceinfo');
       if (cached) { res.set('X-GenieACS-Cache', 'HIT'); return res.json(cached); }
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
+      if (shouldRefresh) {
+        await client.getDeviceParameterSnapshot(serialNumber, { refresh: true });
+        invalidateGenieACSResponseCache(ispId, serialNumber);
+      }
 
 
       // ----- 2. Trigger DeviceInfo refresh (asynchronous) -----
@@ -2940,6 +3182,19 @@ class ServiceController {
         connectedDevices: await this.getConnectedDevices(device, serialNumber, client)
       };
 
+      const linkedOnt = await this.prisma.oNT.findFirst({
+        where: { ispId: Number(ispId), isDeleted: false, serialNumber: { in: ponSerialCandidates(serialNumber) } },
+        include: { olt: { select: { id: true, name: true, vendor: true } }, ontDetails: { select: { opticalDiagnostics: true } } }
+      });
+      formattedDevice.oltOptics = linkedOnt ? {
+        ontRxPower: linkedOnt.rxPower,
+        oltRxPower: extractOltRxPower(linkedOnt),
+        oltName: linkedOnt.olt?.name || null,
+        oltVendor: linkedOnt.olt?.vendor || null,
+        servicePort: linkedOnt.servicePort,
+        lastSync: linkedOnt.lastSync
+      } : null;
+
       const response = {
         success: true,
         data: formattedDevice
@@ -2961,10 +3216,39 @@ class ServiceController {
       res.set('Cache-Control', 'no-store');
       const ispId = req.ispId;
       const { serialNumber } = req.params;
-      const cached = getCachedGenieACSResponse(ispId, serialNumber, 'waninfo');
-      if (cached) { res.set('X-GenieACS-Cache', 'HIT'); return res.json(cached); }
+      const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+      const shouldPullLive = shouldRefresh || String(req.query.live || '').toLowerCase() === 'true';
+      if (!shouldPullLive) {
+        const storedDevice = await this.prisma.tr069Device.findFirst({
+          where: { ispId, serialNumber, isDeleted: false },
+          select: { wanSnapshot: true, wanSnapshotAt: true }
+        });
+        if (storedDevice?.wanSnapshot) {
+          res.set('X-GenieACS-Cache', 'DATABASE');
+          return res.json({
+            ...storedDevice.wanSnapshot,
+            meta: {
+              ...(storedDevice.wanSnapshot.meta || {}),
+              source: 'database',
+              snapshotAt: storedDevice.wanSnapshotAt
+            }
+          });
+        }
+
+        const cached = getCachedGenieACSResponse(ispId, serialNumber, 'waninfo');
+        if (cached) {
+          res.set('X-GenieACS-Cache', 'MEMORY');
+          return res.json(cached);
+        }
+      }
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
+      if (shouldRefresh) {
+        await client.refreshObject(serialNumber, 'InternetGatewayDevice.WANDevice').catch(error =>
+          console.warn(`[${serialNumber}] WAN refresh could not complete immediately:`, error.message)
+        );
+        invalidateGenieACSResponseCache(ispId, serialNumber);
+      }
 
       // ----- 1. Trigger WAN refresh (asynchronous) -----
       // try {
@@ -3036,10 +3320,51 @@ class ServiceController {
 
       };
 
+      const linkedOnt = await this.prisma.oNT.findFirst({
+        where: { ispId: Number(ispId), isDeleted: false, serialNumber: { in: ponSerialCandidates(serialNumber) } },
+        include: {
+          olt: { select: { id: true, name: true, vendor: true } },
+          ontDetails: { select: { opticalDiagnostics: true } }
+        }
+      });
+      formattedDevice.oltOptics = linkedOnt ? {
+        ontRxPower: linkedOnt.rxPower,
+        oltRxPower: extractOltRxPower(linkedOnt),
+        oltName: linkedOnt.olt?.name || null,
+        oltVendor: linkedOnt.olt?.vendor || null,
+        servicePort: linkedOnt.servicePort,
+        lastSync: linkedOnt.lastSync
+      } : null;
+
       const response = {
         success: true,
-        data: formattedDevice
+        data: formattedDevice,
+        meta: {
+          source: shouldRefresh ? 'genieacs-refresh' : shouldPullLive ? 'genieacs-live' : 'genieacs',
+          snapshotAt: new Date().toISOString()
+        }
       };
+      const snapshotAt = new Date();
+      const persisted = await this.prisma.tr069Device.updateMany({
+        where: { ispId, serialNumber, isDeleted: false },
+        data: { wanSnapshot: response, wanSnapshotAt: snapshotAt, updatedAt: snapshotAt }
+      });
+      if (!persisted.count) {
+        await this.prisma.tr069Device.create({
+          data: {
+            ispId,
+            serialNumber,
+            oui: formattedDevice.oui || null,
+            productClass: formattedDevice.productClass || null,
+            manufacturer: formattedDevice.manufacturer || null,
+            status: String(formattedDevice.status || 'offline').toLowerCase(),
+            lastContact: device._lastInform ? new Date(device._lastInform) : null,
+            wanSnapshot: response,
+            wanSnapshotAt: snapshotAt,
+            updatedAt: snapshotAt
+          }
+        });
+      }
       setCachedGenieACSResponse(ispId, serialNumber, 'waninfo', response);
       res.set('X-GenieACS-Cache', 'MISS');
       return res.json(response);
@@ -3053,10 +3378,37 @@ class ServiceController {
 
   async getGenieACSDeviceWlanInfo(req, res) {
     try {
+      res.set('Cache-Control', 'no-store');
       const ispId = req.ispId;
       const { serialNumber } = req.params;
+      const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+      const shouldPullLive = shouldRefresh || String(req.query.live || '').toLowerCase() === 'true';
+      const storedDevice = await this.prisma.tr069Device.findFirst({
+        where: { ispId, serialNumber, isDeleted: false },
+        select: { wifiSnapshot: true, wifiSnapshotAt: true }
+      });
+
+      if (!shouldPullLive && storedDevice?.wifiSnapshot) {
+        res.set('X-GenieACS-Cache', 'DATABASE');
+        return res.json({
+          ...storedDevice.wifiSnapshot,
+          meta: {
+            ...(storedDevice.wifiSnapshot.meta || {}),
+            source: 'database',
+            snapshotAt: storedDevice.wifiSnapshot.meta?.snapshotAt || storedDevice.wifiSnapshotAt
+          }
+        });
+      }
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
+      if (shouldRefresh) {
+        await Promise.all([
+          client.refreshObject(serialNumber, 'InternetGatewayDevice.LANDevice.1.WLANConfiguration'),
+          client.refreshObject(serialNumber, 'Device.WiFi')
+        ].map(task => task.catch(error =>
+          console.warn(`[${serialNumber}] WiFi refresh could not complete immediately:`, error.message)
+        )));
+      }
 
       // ----- 1. Trigger WAN refresh (asynchronous) -----
       // try {
@@ -3110,6 +3462,17 @@ class ServiceController {
       const deviceInfoObj = device?.InternetGatewayDevice?.DeviceInfo;
 
       // ----- 8. Build the complete response -----
+      const rawSsidList = await this.getSSIDDetails(device, serialNumber, null);
+      const customer = await this.findCustomerForSerial(serialNumber, req);
+      if (customer && Array.isArray(rawSsidList)) {
+        await this.syncWifiCredentialsForCustomer(customer, serialNumber, rawSsidList);
+      }
+      const customerMergedSsids = customer && Array.isArray(rawSsidList)
+        ? await this.attachStoredWifiCredentials(customer, serialNumber, rawSsidList)
+        : rawSsidList;
+      const storedSsids = storedDevice?.wifiSnapshot?.data?.ssidList || [];
+      const ssidList = mergeWifiSnapshotPasswords(customerMergedSsids, storedSsids);
+
       const formattedDevice = {
         id: device._id,
         serialNumber: this.extractParameterValue(device, '_deviceId._SerialNumber'),
@@ -3123,15 +3486,45 @@ class ServiceController {
         ),
 
 
-        ssidList: await this.getSSIDDetails(device, serialNumber, client),
+        ssidList,
+        ...(Array.isArray(storedDevice?.wifiSnapshot?.data?.connectedDevices)
+          ? { connectedDevices: storedDevice.wifiSnapshot.data.connectedDevices }
+          : {}),
 
 
       };
 
-      return res.json({
+      const snapshotAt = new Date();
+      const response = {
         success: true,
-        data: formattedDevice
+        data: formattedDevice,
+        meta: {
+          source: shouldRefresh ? 'genieacs-refresh' : shouldPullLive ? 'genieacs-live' : 'genieacs',
+          snapshotAt: snapshotAt.toISOString(),
+          ...(storedDevice?.wifiSnapshot?.meta?.mapSnapshotAt
+            ? { mapSnapshotAt: storedDevice.wifiSnapshot.meta.mapSnapshotAt }
+            : {})
+        }
+      };
+      const persisted = await this.prisma.tr069Device.updateMany({
+        where: { ispId, serialNumber, isDeleted: false },
+        data: { wifiSnapshot: response, wifiSnapshotAt: snapshotAt, updatedAt: snapshotAt }
       });
+      if (!persisted.count) {
+        await this.prisma.tr069Device.create({
+          data: {
+            ispId,
+            serialNumber,
+            status: String(formattedDevice.status || 'offline').toLowerCase(),
+            lastContact: device._lastInform ? new Date(device._lastInform) : null,
+            wifiSnapshot: response,
+            wifiSnapshotAt: snapshotAt,
+            updatedAt: snapshotAt
+          }
+        });
+      }
+      res.set('X-GenieACS-Cache', 'MISS');
+      return res.json(response);
 
     } catch (error) {
       console.error("Error getting GenieACS device:", error);
@@ -3141,24 +3534,60 @@ class ServiceController {
 
   async getGenieACSDeviceConnectedDevicesInfo(req, res) {
     try {
+      res.set('Cache-Control', 'no-store');
       const ispId = req.ispId;
       const { serialNumber } = req.params;
+      const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+      const shouldPullLive = shouldRefresh || String(req.query.live || '').toLowerCase() === 'true';
+      const storedDevice = await this.prisma.tr069Device.findFirst({
+        where: { ispId, serialNumber, isDeleted: false },
+        select: { id: true, wifiSnapshot: true, wifiSnapshotAt: true }
+      });
+      const storedClients = storedDevice?.wifiSnapshot?.data?.connectedDevices;
+
+      if (!shouldPullLive && Array.isArray(storedClients)) {
+        res.set('X-GenieACS-Cache', 'DATABASE');
+        return res.json({
+          success: true,
+          data: {
+            ...(storedDevice.wifiSnapshot?.data || {}),
+            serialNumber,
+            connectedDevices: storedClients
+          },
+          meta: {
+            source: 'database',
+            snapshotAt: storedDevice.wifiSnapshot?.meta?.mapSnapshotAt || storedDevice.wifiSnapshotAt
+          }
+        });
+      }
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
+      if (shouldRefresh) {
+        const refreshRoots = [
+          'InternetGatewayDevice.LANDevice.1.Hosts',
+          'InternetGatewayDevice.LANDevice.1.WLANConfiguration',
+          'Device.Hosts',
+          'Device.WiFi'
+        ];
+        await Promise.all(refreshRoots.map(objectName =>
+          client.refreshObject(serialNumber, objectName, {
+            requestTimeoutMs: 8000,
+            connectionRequestTimeoutMs: 3000
+          }).catch(error =>
+            console.warn(`[${serialNumber}] Topology refresh for ${objectName} could not complete immediately:`, error.message)
+          )
+        ));
+      }
 
-      // ----- 3. Fetch device with comprehensive projection -----
       const projection = `
       _id,
       _deviceId,
       _lastInform,
       InternetGatewayDevice.DeviceInfo,
-      InternetGatewayDevice.WANDevice,
       InternetGatewayDevice.LANDevice,
-      InternetGatewayDevice.WLANConfiguration,
       Device.DeviceInfo,
       Device.WiFi,
-      Device.Hosts,
-      VirtualParameters
+      Device.Hosts
     `;
 
       const device = await client.getDeviceBySerial(serialNumber, { projection });
@@ -3169,103 +3598,77 @@ class ServiceController {
         });
       }
 
-      // ----- 4. Online status calculation -----
-      const ONLINE_THRESHOLD = 5 * 60 * 1000;
-      const now = new Date();
-      const lastInform = device._lastInform ? new Date(device._lastInform) : null;
-      const isOnline = lastInform && (now - lastInform) < ONLINE_THRESHOLD;
-
-      // ----- 5. Format uptime -----
-
-      // ----- 6. Extract all DeviceInfo parameters -----
-      const deviceInfoObj = device?.InternetGatewayDevice?.DeviceInfo;
-      const deviceInfoParams = this.extractAllParameters(deviceInfoObj, 'InternetGatewayDevice.DeviceInfo');
-
-      // ----- 7. Build the enhanced deviceInfo object -----
-      const deviceInfo = {
-        // Basic info
-        modelName: this.extractParameterValue(deviceInfoObj, 'ModelName'),
-        description: this.extractParameterValue(deviceInfoObj, 'Description'),
-        hardwareVersion: this.extractParameterValue(deviceInfoObj, 'HardwareVersion'),
-        softwareVersion: this.extractParameterValue(deviceInfoObj, 'SoftwareVersion'),
-        firmwareVersion: this.extractParameterValue(deviceInfoObj, 'FirmwareVersion'),
-        serialNumber: this.extractParameterValue(deviceInfoObj, 'SerialNumber'),
-        productClass: this.extractParameterValue(deviceInfoObj, 'ProductClass'),
-        manufacturer: this.extractParameterValue(deviceInfoObj, 'Manufacturer'),
-        manufacturerOUI: this.extractParameterValue(deviceInfoObj, 'ManufacturerOUI'),
-
-        // Access & provisioning
-        accessType: this.extractParameterValue(deviceInfoObj, 'AccessType'),
-        provisioningCode: this.extractParameterValue(deviceInfoObj, 'ProvisioningCode'),
-
-        // System status
-        uptimeSeconds: this.extractParameterValue(deviceInfoObj, 'UpTime'),
-        uptime: this.formatUptime(this.extractParameterValue(deviceInfoObj, 'UpTime')),
-        firstUseDate: this.extractParameterValue(deviceInfoObj, 'FirstUseDate'),
-        deviceLog: this.extractParameterValue(deviceInfoObj, 'DeviceLog'), // raw log snippet
-        specVersion: this.extractParameterValue(deviceInfoObj, 'SpecVersion'),
-
-        // Memory & CPU
-        memoryFree: this.extractParameterValue(deviceInfoObj, 'MemoryStatus.Free'),
-        memoryTotal: this.extractParameterValue(deviceInfoObj, 'MemoryStatus.Total'),
-        cpuUsage: this.extractParameterValue(deviceInfoObj, 'ProcessStatus.CPUUsage'),
-        cpuTemp: this.extractParameterValue(deviceInfoObj, 'VirtualParameters.Temperature'),
-
-        // Additional versions
-        additionalHardwareVersion: this.extractParameterValue(deviceInfoObj, 'AdditionalHardwareVersion'),
-        additionalSoftwareVersion: this.extractParameterValue(deviceInfoObj, 'AdditionalSoftwareVersion'),
-
-        // Vendor-specific fields (common ones)
-        xAluComGeUpLinkEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_GEUpLinkEnable'),
-        xAluComNatNumberOfEntries: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_NATNumberOfEntries'),
-        xAluComVoiceNetworkMode: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_VoiceNetworkMode'),
-        xAluComServiceManage: {
-          sshEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.SshEnable'),
-          sshPort: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.SshPort'),
-          telnetEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.TelnetEnable'),
-          telnetPort: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.TelnetPort'),
-          ftpEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.FtpEnable'),
-          sftpEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.SftpEnable'),
-          sambaEnable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.SambaEnable'),
-          wanHttpsPort: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.WanHttpsPort'),
-          managementIdleDisconnectTime: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_ServiceManage.ManagementIdleDisconnectTime'),
-        },
-        xAluComWolan: {
-          enable: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_WOLAN.Enable'),
-          publicPort: this.extractParameterValue(deviceInfoObj, 'X_ALU-COM_WOLAN.PublicPort'),
-        },
-
-        // Supported data models
-        supportedDataModelEntries: this.extractParameterValue(deviceInfoObj, 'SupportedDataModelNumberOfEntries'),
-
-        // 🆕 ALL parameters in a clean, flat key-value format (last segment only)
-        parameters: this.flattenParameters(deviceInfoParams)
-      };
-
-      // ----- 8. Build the complete response -----
+      const connectedDevices = await this.getConnectedDevices(device, serialNumber, null);
+      const snapshotAt = new Date();
       const formattedDevice = {
         id: device._id,
         serialNumber: this.extractParameterValue(device, '_deviceId._SerialNumber'),
-        productClass: this.extractParameterValue(device, '_deviceId._ProductClass'),
         manufacturer: this.extractParameterValue(device, '_deviceId._Manufacturer'),
+        productClass: this.extractParameterValue(device, '_deviceId._ProductClass'),
         oui: this.extractParameterValue(device, '_deviceId._OUI'),
-
-        status: isOnline ? "Online" : "Offline",
+        modelName: firstMeaningful(
+          this.extractParameterValue(device, 'InternetGatewayDevice.DeviceInfo.ModelName'),
+          this.extractParameterValue(device, 'Device.DeviceInfo.ModelName')
+        ) || 'N/A',
+        softwareVersion: firstMeaningful(
+          this.extractParameterValue(device, 'InternetGatewayDevice.DeviceInfo.SoftwareVersion'),
+          this.extractParameterValue(device, 'Device.DeviceInfo.SoftwareVersion')
+        ) || 'N/A',
         lastContact: device._lastInform || "N/A",
-        uptime: this.formatUptime(
-          this.extractParameterValue(device, 'InternetGatewayDevice.DeviceInfo.UpTime')
-        ),
-
-
-        // 📶 Connected LAN / WiFi clients
-        connectedDevices: await this.getConnectedDevices(device, serialNumber, client),
-
+        connectedDevices
+      };
+      const response = {
+        success: true,
+        data: formattedDevice,
+        meta: {
+          source: shouldRefresh ? 'genieacs-refresh' : shouldPullLive ? 'genieacs-live' : 'genieacs',
+          snapshotAt: snapshotAt.toISOString()
+        }
       };
 
-      return res.json({
-        success: true,
-        data: formattedDevice
-      });
+      if (storedDevice) {
+        const currentSnapshot = storedDevice.wifiSnapshot && typeof storedDevice.wifiSnapshot === 'object'
+          ? storedDevice.wifiSnapshot
+          : { success: true, data: { serialNumber, ssidList: [] }, meta: {} };
+        const combinedSnapshot = {
+          ...currentSnapshot,
+          success: true,
+          data: {
+            ...(currentSnapshot.data || {}),
+            ...formattedDevice
+          },
+          meta: {
+            ...(currentSnapshot.meta || {}),
+            mapSource: response.meta.source,
+            mapSnapshotAt: snapshotAt.toISOString()
+          }
+        };
+        await this.prisma.tr069Device.update({
+          where: { id: storedDevice.id },
+          data: { wifiSnapshot: combinedSnapshot, wifiSnapshotAt: snapshotAt, updatedAt: snapshotAt }
+        });
+      } else {
+        await this.prisma.tr069Device.create({
+          data: {
+            ispId,
+            serialNumber,
+            status: 'offline',
+            wifiSnapshot: {
+              success: true,
+              data: { ...formattedDevice, ssidList: [] },
+              meta: {
+                mapSource: response.meta.source,
+                mapSnapshotAt: snapshotAt.toISOString()
+              }
+            },
+            wifiSnapshotAt: snapshotAt,
+            updatedAt: snapshotAt
+          }
+        });
+      }
+
+      res.set('X-GenieACS-Cache', 'MISS');
+      return res.json(response);
 
     } catch (error) {
       console.error("Error getting GenieACS device:", error);
@@ -3360,18 +3763,21 @@ class ServiceController {
       }
 
       // ----- EXTRACT WIFI ASSOCIATED DEVICES (TR-098) -----
-      if (device?.InternetGatewayDevice?.WLANConfiguration) {
-        Object.keys(device.InternetGatewayDevice.WLANConfiguration).forEach(wlanKey => {
-          if (isNaN(wlanKey)) return;
+      // WLANConfiguration is nested under each LANDevice in TR-098.
+      if (device?.InternetGatewayDevice?.LANDevice) {
+        Object.keys(device.InternetGatewayDevice.LANDevice).forEach(lanDeviceKey => {
+          if (isNaN(lanDeviceKey)) return;
+          const wlanConfigurations = device.InternetGatewayDevice.LANDevice[lanDeviceKey]?.WLANConfiguration;
+          if (!wlanConfigurations) return;
 
-          const wlan = device.InternetGatewayDevice.WLANConfiguration[wlanKey];
+          Object.keys(wlanConfigurations).forEach(wlanKey => {
+            if (isNaN(wlanKey)) return;
+            const wlan = wlanConfigurations[wlanKey];
+            if (!wlan?.AssociatedDevice) return;
 
-          if (wlan?.AssociatedDevice) {
             Object.keys(wlan.AssociatedDevice).forEach(deviceKey => {
               if (isNaN(deviceKey)) return;
-
               const associatedDevice = wlan.AssociatedDevice[deviceKey];
-
               const getValue = (obj, field) => {
                 if (!obj || !obj[field]) return null;
                 const val = obj[field];
@@ -3381,28 +3787,119 @@ class ServiceController {
               const macAddress = getValue(associatedDevice, 'MACAddress') ||
                 getValue(associatedDevice, 'AssociatedDeviceMACAddress');
               const ipAddress = getValue(associatedDevice, 'IPAddress');
-              const hostName = getValue(associatedDevice, 'HostName');
-              const signalStrength = getValue(associatedDevice, 'SignalStrength');
+              if (!macAddress && !ipAddress) return;
+              const authenticatedValue = getValue(associatedDevice, 'AssociatedDeviceAuthenticationState') ??
+                getValue(associatedDevice, 'AuthenticationState');
+              const authenticated = authenticatedValue === true || authenticatedValue === 'true' || authenticatedValue === 1;
+              const associatedValue = (...fields) => fields
+                .map(field => getValue(associatedDevice, field))
+                .find(value => value !== null && value !== undefined && value !== '' && value !== 'N/A');
+              const signal = normalizeReportedSignal(associatedValue(
+                'SignalStrength',
+                'RSSI',
+                'X_ALU-COM_SignalStrength',
+                'X_BROADCOM_COM_RSSI',
+                'X_HW_RSSI',
+                'X_CT-COM_RSSI'
+              ));
+              const channel = Number(this.extractParameterValue(wlan, 'Channel'));
+              const supportedBand = String(
+                this.extractParameterValue(wlan, 'OperatingFrequencyBand') ||
+                this.extractParameterValue(wlan, 'SupportedFrequencyBands') ||
+                ''
+              );
+              const band = /5/i.test(supportedBand) || channel > 14 || Number(wlanKey) >= 5 ? '5 GHz' : '2.4 GHz';
 
-              if (macAddress || ipAddress) {
-                connectedDevices.push({
-                  hostName: hostName || 'Unknown',
-                  ipAddress: ipAddress || 'N/A',
-                  macAddress: macAddress || 'N/A',
-                  associatedDeviceMACAddress: getValue(associatedDevice, 'AssociatedDeviceMACAddress') || macAddress || 'N/A',
-                  authenticationState: getValue(associatedDevice, 'AuthenticationState'),
-                  lastDataDownlinkRate: getValue(associatedDevice, 'LastDataDownlinkRate'),
-                  lastDataUplinkRate: getValue(associatedDevice, 'LastDataUplinkRate'),
-                  signalStrength: signalStrength,
-                  retransmissions: getValue(associatedDevice, 'Retransmissions'),
-                  active: true, // Associated devices are always active
-                  type: 'WiFi',
-                  source: 'WLANConfiguration.AssociatedDevice',
-                  lastSeen: new Date().toISOString()
-                });
-              }
+              connectedDevices.push({
+                hostName: getValue(associatedDevice, 'HostName') || 'Unknown',
+                ipAddress: ipAddress || 'N/A',
+                macAddress: macAddress || 'N/A',
+                associatedDeviceMACAddress: getValue(associatedDevice, 'AssociatedDeviceMACAddress') || macAddress || 'N/A',
+                authenticationState: authenticatedValue,
+                authenticated,
+                lastDataDownlinkRate: associatedValue('LastDataDownlinkRate', 'LastDataDownlinkRateMbps', 'RxRate'),
+                lastDataUplinkRate: associatedValue('LastDataUplinkRate', 'LastDataUplinkRateMbps', 'TxRate'),
+                signalStrength: signal,
+                rssi: signal,
+                noise: associatedValue('Noise', 'NoiseFloor', 'X_ALU-COM_Noise'),
+                snr: associatedValue('SNR', 'SignalNoiseRatio', 'X_ALU-COM_SNR'),
+                retransmissions: associatedValue('Retransmissions', 'RetransmissionCount'),
+                operatingStandard: associatedValue('OperatingStandard', 'Standard'),
+                bytesSent: associatedValue('BytesSent', 'Stats.BytesSent'),
+                bytesReceived: associatedValue('BytesReceived', 'Stats.BytesReceived'),
+                active: true,
+                interfaceType: 'WiFi',
+                ssid: this.extractParameterValue(wlan, 'SSID'),
+                band,
+                channel: Number.isFinite(channel) && channel > 0 ? channel : null,
+                wlanInstance: wlanKey,
+                type: 'WiFi',
+                source: 'LANDevice.WLANConfiguration.AssociatedDevice',
+                lastSeen: new Date().toISOString()
+              });
             });
-          }
+          });
+        });
+      }
+
+      // ----- EXTRACT WIFI ASSOCIATED DEVICES (TR-181) -----
+      if (device?.Device?.WiFi?.AccessPoint) {
+        const ssids = device.Device.WiFi.SSID || {};
+        Object.keys(device.Device.WiFi.AccessPoint).forEach(apKey => {
+          if (isNaN(apKey)) return;
+          const accessPoint = device.Device.WiFi.AccessPoint[apKey];
+          if (!accessPoint?.AssociatedDevice) return;
+          const getValue = (obj, field) => {
+            if (!obj || obj[field] === undefined || obj[field] === null) return null;
+            const val = obj[field];
+            return val?._value ?? val;
+          };
+          const ssidReference = String(getValue(accessPoint, 'SSIDReference') || '');
+          const ssidIndex = ssidReference.match(/SSID\.(\d+)/)?.[1] || apKey;
+          const ssidObject = ssids[ssidIndex];
+          const radioReference = String(getValue(ssidObject, 'LowerLayers') || '');
+          const radioIndex = radioReference.match(/Radio\.(\d+)/)?.[1];
+          const radio = radioIndex ? device.Device.WiFi.Radio?.[radioIndex] : null;
+          const channel = Number(getValue(radio, 'Channel'));
+          const frequencyBand = String(getValue(radio, 'OperatingFrequencyBand') || '');
+          const band = /5/i.test(frequencyBand) || channel > 14 ? '5 GHz' : '2.4 GHz';
+
+          Object.keys(accessPoint.AssociatedDevice).forEach(deviceKey => {
+            if (isNaN(deviceKey)) return;
+            const associatedDevice = accessPoint.AssociatedDevice[deviceKey];
+            const associatedValue = (...fields) => fields
+              .map(field => getValue(associatedDevice, field))
+              .find(value => value !== null && value !== undefined && value !== '' && value !== 'N/A');
+            const macAddress = associatedValue('MACAddress', 'AssociatedDeviceMACAddress');
+            if (!macAddress) return;
+            const signal = normalizeReportedSignal(associatedValue('SignalStrength', 'RSSI'));
+            const authenticatedValue = associatedValue('AuthenticationState', 'AssociatedDeviceAuthenticationState');
+            connectedDevices.push({
+              hostName: associatedValue('HostName') || 'Unknown',
+              ipAddress: associatedValue('IPAddress') || 'N/A',
+              macAddress,
+              associatedDeviceMACAddress: macAddress,
+              authenticationState: authenticatedValue,
+              authenticated: authenticatedValue === true || authenticatedValue === 'true' || authenticatedValue === 1,
+              lastDataDownlinkRate: associatedValue('LastDataDownlinkRate', 'RxRate'),
+              lastDataUplinkRate: associatedValue('LastDataUplinkRate', 'TxRate'),
+              signalStrength: signal,
+              rssi: signal,
+              noise: associatedValue('Noise', 'NoiseFloor'),
+              snr: associatedValue('SNR', 'SignalNoiseRatio'),
+              retransmissions: associatedValue('Retransmissions', 'RetransmissionCount'),
+              operatingStandard: associatedValue('OperatingStandard', 'Standard'),
+              active: true,
+              interfaceType: 'WiFi',
+              ssid: getValue(ssidObject, 'SSID') || 'Unknown SSID',
+              band,
+              channel: Number.isFinite(channel) && channel > 0 ? channel : null,
+              wlanInstance: apKey,
+              type: 'WiFi',
+              source: 'Device.WiFi.AccessPoint.AssociatedDevice',
+              lastSeen: new Date().toISOString()
+            });
+          });
         });
       }
 
@@ -3440,33 +3937,7 @@ class ServiceController {
         });
       }
 
-      // Remove duplicates based on MAC address (case insensitive)
-      const uniqueDevices = Array.from(
-        new Map(
-          connectedDevices
-            .filter(d => d.macAddress && d.macAddress !== 'N/A' && d.macAddress !== '')
-            .map(d => [d.macAddress.toLowerCase(), d])
-        ).values()
-      );
-
-      // Sort by active status first, then by hostName
-      uniqueDevices.sort((a, b) => {
-        if (a.active === b.active) {
-          return (a.hostName || '').localeCompare(b.hostName || '');
-        }
-        return a.active ? -1 : 1;
-      });
-
-      console.log(`[getConnectedDevices] Found ${uniqueDevices.length} unique devices for ${serialNumber}`);
-      if (uniqueDevices.length === 0) {
-        return [
-          { hostName: "Kalyan", macAddress: "38:ba:f8:a0:cd:14", ipAddress: "192.168.101.9", active: true, interfaceType: "802.11", type: "WiFi", lastSeen: new Date().toISOString() },
-          { hostName: "Kalyan", macAddress: "4c:23:38:76:fb:71", ipAddress: "192.168.101.4", active: true, interfaceType: "802.11", type: "WiFi", lastSeen: new Date().toISOString() },
-          { hostName: "V2036", macAddress: "f6:74:79:b1:e0:0b", ipAddress: "192.168.101.2", active: true, interfaceType: "802.11", type: "WiFi", lastSeen: new Date().toISOString() },
-          { hostName: "V2538", macAddress: "c2:9e:d6:80:b8:43", ipAddress: "192.168.101.7", active: true, interfaceType: "802.11", type: "WiFi", lastSeen: new Date().toISOString() },
-          { hostName: "Xiaomi-Pad-6", macAddress: "6e:99:ce:d0:2d:e4", ipAddress: "192.168.101.8", active: true, interfaceType: "802.11", type: "WiFi", lastSeen: new Date().toISOString() }
-        ];
-      }
+      const uniqueDevices = mergeConnectedDeviceRecords(connectedDevices);
       return uniqueDevices;
 
     } catch (error) {
@@ -3477,11 +3948,37 @@ class ServiceController {
 
   async getGenieACSDeviceLANInfo(req, res) {
     try {
+      res.set('Cache-Control', 'no-store');
       const ispId = req.ispId;
       const { serialNumber } = req.params;
+      const shouldRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+      const storedDevice = await this.prisma.tr069Device.findFirst({
+        where: { ispId, serialNumber, isDeleted: false },
+        select: { id: true, lanSnapshot: true, lanSnapshotAt: true }
+      });
+
+      if (!shouldRefresh && storedDevice?.lanSnapshot) {
+        res.set('X-GenieACS-Cache', 'DATABASE');
+        return res.json({
+          ...storedDevice.lanSnapshot,
+          meta: {
+            ...(storedDevice.lanSnapshot.meta || {}),
+            source: 'database',
+            snapshotAt: storedDevice.lanSnapshotAt
+          }
+        });
+      }
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
-
+      if (shouldRefresh) {
+        await Promise.all([
+          'InternetGatewayDevice.LANDevice',
+          'Device.IP.Interface',
+          'Device.DHCPv4.Server'
+        ].map(objectName => client.refreshObject(serialNumber, objectName).catch(error =>
+          console.warn(`[${serialNumber}] LAN refresh for ${objectName} could not complete immediately:`, error.message)
+        )));
+      }
 
 
       // ----- 2. Trigger DeviceInfo refresh (asynchronous) -----
@@ -3605,21 +4102,122 @@ class ServiceController {
 
         // 📶 LAN Ethernet interfaces
         lanInterfaces: this.getLANInterfaces(device),
-
-
-
+        lanConfiguration: normalizeLanConfiguration(device)
       };
 
-      console.log("Device ID", device)
-
-      return res.json({
+      const snapshotAt = new Date();
+      const response = {
         success: true,
-        data: formattedDevice
-      });
+        data: formattedDevice,
+        meta: {
+          source: shouldRefresh ? 'genieacs-refresh' : 'genieacs',
+          snapshotAt: snapshotAt.toISOString()
+        }
+      };
+      const snapshotData = {
+        status: formattedDevice.status.toLowerCase(),
+        lastContact: lastInform,
+        lanSnapshot: response,
+        lanSnapshotAt: snapshotAt,
+        updatedAt: snapshotAt
+      };
+      if (storedDevice) {
+        await this.prisma.tr069Device.update({ where: { id: storedDevice.id }, data: snapshotData });
+      } else {
+        await this.prisma.tr069Device.create({
+          data: { ispId, serialNumber, ...snapshotData }
+        });
+      }
+      res.set('X-GenieACS-Cache', 'MISS');
+      return res.json(response);
 
     } catch (error) {
       console.error("Error getting GenieACS device:", error);
       return this.sendGenieACSError(res, error, 'Failed to get device');
+    }
+  }
+
+  async updateGenieACSDeviceLANInfo(req, res) {
+    try {
+      res.set('Cache-Control', 'no-store');
+      const ispId = req.ispId;
+      const { serialNumber } = req.params;
+      const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
+      const device = await client.getDeviceBySerial(serialNumber, {
+        projection: '_id,InternetGatewayDevice.LANDevice,Device.IP.Interface,Device.DHCPv4.Server'
+      });
+      if (!device) {
+        return res.status(404).json({ success: false, message: `Device with serial ${serialNumber} not found` });
+      }
+
+      const current = normalizeLanConfiguration(device);
+      if (!current.supported) {
+        return res.status(422).json({ success: false, message: current.message });
+      }
+      const next = {
+        ...current.parameters,
+        ...req.body,
+        dhcpEnabled: req.body.dhcpEnabled === undefined
+          ? current.parameters.dhcpEnabled
+          : (typeof req.body.dhcpEnabled === 'boolean'
+            ? req.body.dhcpEnabled
+            : /^(?:true|1|yes|on|enabled)$/i.test(String(req.body.dhcpEnabled)))
+      };
+      const parameterValues = buildLanParameterValues(current, next);
+      const task = await client.createTask(serialNumber, { name: 'setParameterValues', parameterValues });
+      invalidateGenieACSResponseCache(ispId, serialNumber);
+
+      const storedDevice = await this.prisma.tr069Device.findFirst({
+        where: { ispId, serialNumber, isDeleted: false },
+        select: { id: true, lanSnapshot: true }
+      });
+      if (storedDevice) {
+        const snapshotAt = new Date();
+        const existing = storedDevice.lanSnapshot && typeof storedDevice.lanSnapshot === 'object'
+          ? storedDevice.lanSnapshot
+          : { success: true, data: { serialNumber, lanInterfaces: [] } };
+        await this.prisma.tr069Device.update({
+          where: { id: storedDevice.id },
+          data: {
+            lanSnapshot: {
+              ...existing,
+              data: {
+                ...(existing.data || {}),
+                lanConfiguration: {
+                  ...current,
+                  parameters: next,
+                  pending: true,
+                  pendingTaskId: task.taskId
+                }
+              },
+              meta: {
+                ...(existing.meta || {}),
+                source: 'pending-update',
+                snapshotAt: snapshotAt.toISOString()
+              }
+            },
+            lanSnapshotAt: snapshotAt,
+            updatedAt: snapshotAt
+          }
+        });
+      }
+
+      return res.status(task.status === 'queued' ? 202 : 200).json({
+        success: true,
+        data: {
+          task,
+          dataModel: current.dataModel,
+          parameters: next,
+          message: task.status === 'queued'
+            ? 'LAN and DHCP changes were queued. The CPE will apply them on its next contact.'
+            : 'LAN and DHCP changes were applied.'
+        }
+      });
+    } catch (error) {
+      const status = error.statusCode || 500;
+      if (status < 500) return res.status(status).json({ success: false, message: error.message });
+      console.error('Error updating GenieACS LAN configuration:', error);
+      return this.sendGenieACSError(res, error, 'Failed to update LAN and DHCP configuration');
     }
   }
 
@@ -3657,126 +4255,76 @@ class ServiceController {
   }
 
   getAllWanConnections(device) {
-    const results = [];
-    const wanDevices = device?.InternetGatewayDevice?.WANDevice;
+    return normalizeWanConnections(device);
+  }
 
-    if (!wanDevices) return results;
-
-    const normalizeDns = (dnsObj) => {
-      if (!dnsObj) return [];
-      if (typeof dnsObj === 'string') {
-        return dnsObj.split(',').map(s => s.trim()).filter(Boolean);
+  async getGenieACSDeviceParameters(req, res) {
+    try {
+      const { serialNumber } = req.params;
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const limit = Math.min(500, Math.max(25, Number(req.query.limit) || 100));
+      const search = String(req.query.search || '').trim().toLowerCase();
+      const root = String(req.query.root || '').trim();
+      const access = String(req.query.access || 'all').toLowerCase();
+      const sourceFilter = String(req.query.source || 'all').toLowerCase();
+      const sortBy = ['path', 'value', 'type', 'access', 'source'].includes(String(req.query.sort))
+        ? String(req.query.sort)
+        : 'path';
+      const sortDirection = String(req.query.order || 'asc').toLowerCase() === 'desc' ? -1 : 1;
+      const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, req.ispId);
+      const snapshot = await client.getDeviceParameterSnapshot(serialNumber, {
+        refresh: String(req.query.refresh || '').toLowerCase() === 'true'
+      });
+      if (String(req.query.refresh || '').toLowerCase() === 'true') {
+        invalidateGenieACSResponseCache(req.ispId, serialNumber);
       }
-      const arr = [];
-      Object.keys(dnsObj).forEach(key => {
-        if (!isNaN(key)) {
-          const val = dnsObj[key];
-          arr.push(val?._value ?? val);
-        }
+      const device = snapshot.device;
+      if (!device) return res.status(404).json({ success: false, error: 'TR-069 device not found' });
+      const all = collectTR069ParameterMetadata(device).map(parameter => ({
+        ...parameter,
+        source: parameter.path.startsWith('InternetGatewayDevice.') ? 'TR-098' : parameter.path.startsWith('Device.') ? 'TR-181' : parameter.path.startsWith('VirtualParameters.') ? 'VirtualParameters' : 'GenieACS',
+      }));
+      const filtered = all.filter(parameter =>
+        (!root || parameter.path.startsWith(root)) &&
+        (!search || parameter.path.toLowerCase().includes(search) || String(parameter.value ?? '').toLowerCase().includes(search)) &&
+        (access === 'all' || (access === 'writable' ? parameter.writable : !parameter.writable)) &&
+        (sourceFilter === 'all' || parameter.source.toLowerCase() === sourceFilter)
+      ).sort((a, b) => {
+        const valueFor = parameter => {
+          if (sortBy === 'access') return parameter.writable ? 'writable' : 'read-only';
+          return String(parameter[sortBy] ?? '');
+        };
+        return valueFor(a).localeCompare(valueFor(b), undefined, { numeric: true, sensitivity: 'base' }) * sortDirection;
       });
-      return arr.filter(Boolean);
-    };
-
-    // Iterate over WANDevice instances (1,2,3...)
-    Object.keys(wanDevices).forEach(wanDeviceKey => {
-      if (isNaN(wanDeviceKey)) return;
-
-      const wanConnectionDevices = wanDevices[wanDeviceKey]?.WANConnectionDevice;
-      if (!wanConnectionDevices) return;
-
-      // Iterate over WANConnectionDevice instances
-      Object.keys(wanConnectionDevices).forEach(wcdKey => {
-        if (isNaN(wcdKey)) return;
-
-        const connectionDevice = wanConnectionDevices[wcdKey];
-
-        // ---- WANIPConnection instances ----
-        if (connectionDevice?.WANIPConnection) {
-          Object.keys(connectionDevice.WANIPConnection).forEach(ipKey => {
-            if (isNaN(ipKey)) return;
-
-            const ipConn = connectionDevice.WANIPConnection[ipKey];
-
-            // Extract every parameter under this connection
-            const allParams = this.extractAllParameters(ipConn,
-              `InternetGatewayDevice.WANDevice.${wanDeviceKey}.WANConnectionDevice.${wcdKey}.WANIPConnection.${ipKey}`
-            );
-
-            // Common convenience fields
-            const connection = {
-              wanDeviceIndex: wanDeviceKey,
-              wanConnectionDeviceIndex: wcdKey,
-              connectionIndex: ipKey,
-              type: 'IP',
-              // Quick access fields
-              externalIPAddress: this.extractParameterValue(ipConn, 'ExternalIPAddress'),
-              macAddress: this.extractParameterValue(ipConn, 'MACAddress'),
-              connectionStatus: this.extractParameterValue(ipConn, 'ConnectionStatus'),
-              connectionType: this.extractParameterValue(ipConn, 'ConnectionType'),
-              gateway: this.extractParameterValue(ipConn, 'DefaultGateway'),
-              subnetMask: this.extractParameterValue(ipConn, 'SubnetMask'),
-              dnsServers: normalizeDns(ipConn, 'DNSServers'),
-              mtu: this.extractParameterValue(ipConn, 'MaxMTUSize') || this.extractParameterValue(ipConn, 'InterfaceMtu'),
-              name: this.extractParameterValue(ipConn, 'Name'),
-              uptime: this.extractParameterValue(ipConn, 'Uptime'),
-              // IPv6 fields
-              ipv6Address: this.extractParameterValue(ipConn, 'X_CT-COM_IPv6IPAddress') || this.extractParameterValue(ipConn, 'X_CMS_IPv6IPAddress') || this.extractParameterValue(ipConn, 'IPv6Address'),
-              ipv6Gateway: this.extractParameterValue(ipConn, 'X_CT-COM_DefaultIPv6Gateway') || this.extractParameterValue(ipConn, 'X_CMS_DefaultIPv6Gateway') || this.extractParameterValue(ipConn, 'IPv6Gateway'),
-              ipv6Prefix: this.extractParameterValue(ipConn, 'X_CT-COM_IPv6Prefix') || this.extractParameterValue(ipConn, 'X_CMS_IPv6Prefix') || this.extractParameterValue(ipConn, 'IPv6Prefix'),
-              // Full parameter map
-              parameters: allParams
-            };
-
-            results.push(connection);
-          });
-        }
-
-        // ---- WANPPPConnection instances ----
-        if (connectionDevice?.WANPPPConnection) {
-          Object.keys(connectionDevice.WANPPPConnection).forEach(pppKey => {
-            if (isNaN(pppKey)) return;
-
-            const pppConn = connectionDevice.WANPPPConnection[pppKey];
-
-            const allParams = this.extractAllParameters(pppConn,
-              `InternetGatewayDevice.WANDevice.${wanDeviceKey}.WANConnectionDevice.${wcdKey}.WANPPPConnection.${pppKey}`
-            );
-
-            const connection = {
-              wanDeviceIndex: wanDeviceKey,
-              wanConnectionDeviceIndex: wcdKey,
-              connectionIndex: pppKey,
-              type: 'PPP',
-              // Quick access fields
-              username: this.extractParameterValue(pppConn, 'Username'),
-              connectionStatus: this.extractParameterValue(pppConn, 'ConnectionStatus'),
-              connectionType: this.extractParameterValue(pppConn, 'ConnectionType'),
-              authenticationProtocol: this.extractParameterValue(pppConn, 'AuthenticationProtocol'),
-              dnsServers: normalizeDns(pppConn?.DNSServers),
-              mtu: this.extractParameterValue(pppConn, 'MaxMRUSize') || this.extractParameterValue(pppConn, 'InterfaceMtu'),
-              name: this.extractParameterValue(pppConn, 'Name'),
-              externalIPAddress: this.extractParameterValue(pppConn, 'ExternalIPAddress'),
-              gateway: this.extractParameterValue(pppConn, 'DefaultGateway'),
-              remoteIPAddress: this.extractParameterValue(pppConn, 'RemoteIPAddress'),
-              uptime: this.extractParameterValue(pppConn, 'Uptime'),
-              transportType: this.extractParameterValue(pppConn, 'TransportType'),
-              // IPv6 fields
-              ipv6Address: this.extractParameterValue(pppConn, 'X_CT-COM_IPv6IPAddress') || this.extractParameterValue(pppConn, 'X_CMS_IPv6IPAddress') || this.extractParameterValue(pppConn, 'IPv6Address'),
-              ipv6Gateway: this.extractParameterValue(pppConn, 'X_CT-COM_DefaultIPv6Gateway') || this.extractParameterValue(pppConn, 'X_CMS_DefaultIPv6Gateway') || this.extractParameterValue(pppConn, 'X_CMS_IPv6DefaultGateway') || this.extractParameterValue(pppConn, 'IPv6Gateway') || this.extractParameterValue(pppConn, 'X_CT-COM_DefaultIPv6Gateway'),
-              ipv6Prefix: this.extractParameterValue(pppConn, 'X_CT-COM_IPv6Prefix') || this.extractParameterValue(pppConn, 'X_CMS_IPv6Prefix') || this.extractParameterValue(pppConn, 'IPv6Prefix'),
-              // Full parameter map
-              parameters: allParams
-            };
-
-            results.push(connection);
-          });
-        }
-
-        // ---- EthernetLink, ATM, etc. can be added similarly if needed ----
+      const paths = new Set(all.map(parameter => parameter.path));
+      const supports = prefix => [...paths].some(path => path.startsWith(prefix));
+      const capabilities = {
+        protocolRoots: {
+          tr098: supports('InternetGatewayDevice.'),
+          tr181: supports('Device.'),
+          virtualParameters: supports('VirtualParameters.'),
+        },
+        features: {
+          wan: supports('InternetGatewayDevice.WANDevice.') || supports('Device.IP.Interface.') || supports('Device.PPP.Interface.'),
+          lan: supports('InternetGatewayDevice.LANDevice.') || supports('Device.Hosts.'),
+          wifi: supports('InternetGatewayDevice.LANDevice.1.WLANConfiguration.') || supports('Device.WiFi.'),
+          voice: supports('InternetGatewayDevice.Services.VoiceService.') || supports('Device.Services.VoiceService.'),
+          diagnostics: all.some(parameter => /Diagnostics/.test(parameter.path)),
+          optical: all.some(parameter => /(?:RXPower|RxPower|Optical)/i.test(parameter.path)),
+          liveWanCounters: all.some(parameter => /WAN.*(?:BytesReceived|BytesSent)/i.test(parameter.path)),
+        },
+        parameterLeaves: all.length,
+      };
+      return res.json({
+        success: true,
+        data: filtered.slice((page - 1) * limit, page * limit),
+        capabilities,
+        refreshTasks: snapshot.refreshTasks,
+        pagination: { page, limit, total: filtered.length, totalPages: Math.ceil(filtered.length / limit) },
       });
-    });
-
-    return results;
+    } catch (error) {
+      return this.sendGenieACSError(res, error, 'Failed to read device parameters');
+    }
   }
 
   async getSSIDDetails(device, serialNumber, client) {
@@ -3801,9 +4349,8 @@ class ServiceController {
             //   );
             // }
 
-            const allParams = this.extractAllParameters(wlan,
-              `InternetGatewayDevice.LANDevice.${lanKey}.WLANConfiguration.${wlanKey}`
-            );
+            const parameterRoot = `InternetGatewayDevice.LANDevice.${lanKey}.WLANConfiguration.${wlanKey}`;
+            const allParams = this.extractAllParameters(wlan, parameterRoot);
 
             ssids.push({
               source: 'TR-098',
@@ -3820,7 +4367,12 @@ class ServiceController {
                 this.extractParameterValue(wlan, 'IEEE11iAuthenticationMode'),
               maxBitRate: this.extractParameterValue(wlan, 'MaxBitRate'),
               bssid: this.extractParameterValue(wlan, 'BSSID'),
-              keyPassphrase: this.extractParameterValue(wlan, 'KeyPassphrase'),
+              keyPassphrase: firstMeaningful(
+                this.extractParameterValue(wlan, 'PreSharedKey.1.KeyPassphrase'),
+                this.extractParameterValue(wlan, 'KeyPassphrase'),
+                this.extractParameterValue(wlan, 'X_CMS_KeyPassphrase'),
+                this.extractParameterValue(wlan, 'X_CT-COM_KeyPassphrase')
+              ) || '',
               associatedDeviceCount: this.extractParameterValue(wlan, 'AssociatedDeviceNumberOfEntries'),
               stats: {
                 bytesSent: this.extractParameterValue(wlan, 'Stats.BytesSent'),
@@ -3829,7 +4381,7 @@ class ServiceController {
                 packetsReceived: this.extractParameterValue(wlan, 'Stats.PacketsReceived'),
               },
               // 🆕 Clean, simple key-value pairs for all parameters
-              parameters: this.flattenParameters(allParams)
+              parameters: addRelativeParameterAliases(flattenTR069Parameters(allParams), parameterRoot)
             });
           }
         }
@@ -3844,11 +4396,8 @@ class ServiceController {
           if (isNaN(ssidKey)) continue;
           const ssidObj = device.Device.WiFi.SSID[ssidKey];
 
-          if (client) {
-            client.refreshObject(serialNumber, `Device.WiFi.SSID.${ssidKey}`).catch(() => { });
-          }
-
-          const allParams = this.extractAllParameters(ssidObj, `Device.WiFi.SSID.${ssidKey}`);
+          const parameterRoot = `Device.WiFi.SSID.${ssidKey}`;
+          const allParams = this.extractAllParameters(ssidObj, parameterRoot);
 
           ssids.push({
             source: 'TR-181',
@@ -3863,7 +4412,7 @@ class ServiceController {
               packetsSent: this.extractParameterValue(ssidObj, 'Stats.PacketsSent'),
               packetsReceived: this.extractParameterValue(ssidObj, 'Stats.PacketsReceived'),
             },
-            parameters: this.flattenParameters(allParams)
+            parameters: addRelativeParameterAliases(flattenTR069Parameters(allParams), parameterRoot)
           });
         }
       }
@@ -3874,11 +4423,8 @@ class ServiceController {
           if (isNaN(apKey)) continue;
           const ap = device.Device.WiFi.AccessPoint[apKey];
 
-          if (client) {
-            client.refreshObject(serialNumber, `Device.WiFi.AccessPoint.${apKey}`).catch(() => { });
-          }
-
-          const allParams = this.extractAllParameters(ap, `Device.WiFi.AccessPoint.${apKey}`);
+          const parameterRoot = `Device.WiFi.AccessPoint.${apKey}`;
+          const allParams = this.extractAllParameters(ap, parameterRoot);
 
           ssids.push({
             source: 'TR-181 (AP)',
@@ -3894,16 +4440,28 @@ class ServiceController {
               rekeyInterval: this.extractParameterValue(ap, 'Security.RekeyingInterval')
             },
             ssidReference: this.extractParameterValue(ap, 'SSIDReference'),
-            parameters: this.flattenParameters(allParams)
+            parameters: addRelativeParameterAliases(flattenTR069Parameters(allParams), parameterRoot)
           });
         }
       }
     }
 
+    // TR-181 keeps the SSID name and security credentials in separate tables.
+    // Join AccessPoint.Security back into the referenced SSID before filtering.
+    for (const accessPoint of ssids.filter(item => item.source === 'TR-181 (AP)')) {
+      const referenceIndex = String(accessPoint.ssidReference || '').match(/SSID\.(\d+)/)?.[1]
+        || String(accessPoint.instance || '').match(/AccessPoint\.(\d+)/)?.[1];
+      const target = ssids.find(item => item.instance === `WiFi.SSID.${referenceIndex}`);
+      if (!target) continue;
+      target.security = accessPoint.security;
+      target.keyPassphrase = firstMeaningful(accessPoint.security?.keyPassphrase, target.keyPassphrase) || '';
+      target.parameters = { ...(target.parameters || {}), ...(accessPoint.parameters || {}) };
+    }
+
     // Remove duplicates (same SSID from both models if overlapping)
     const uniqueSsids = Array.from(
       new Map(ssids.map(s => [s.instance, s])).values()
-    ).filter(s => s.ssid && s.ssid !== 'N/A');
+    ).filter(s => s.source !== 'TR-181 (AP)' && s.ssid && s.ssid !== 'N/A');
 
     return uniqueSsids.length > 0 ? uniqueSsids : "No WiFi SSID configurations found";
   }
@@ -3930,7 +4488,15 @@ class ServiceController {
 
       // If it's a parameter object with _value
       if (typeof current === 'object' && '_value' in current) {
-        return current._value ?? 'N/A';
+        const val = current._value;
+        if (val === undefined || val === null) return 'N/A';
+        if (typeof val === 'object') return String(val);
+        return val;
+      }
+
+      // Never return raw objects — they crash React rendering
+      if (typeof current === 'object') {
+        return 'N/A';
       }
 
       return current;
@@ -3995,7 +4561,6 @@ class ServiceController {
             parameters: this.extractAllParameters(iface, `InternetGatewayDevice.LANDevice.${lanDeviceKey}.LANEthernetInterfaceConfig.${ifaceKey}`)
           };
           interfaces.push(interfaceObj);
-          console.log("Interface OBj", interfaceObj)
         });
       }
     });
@@ -4035,6 +4600,62 @@ class ServiceController {
     } catch (error) {
       console.error('Error refreshing GenieACS object:', error);
       return res.status(500).json({ success: false, error: 'Failed to refresh object', message: error.message });
+    }
+  }
+
+  async runGenieACSDiagnostic(req, res) {
+    try {
+      const { serialNumber } = req.params;
+      const type = String(req.body.type || '').toLowerCase();
+      const target = String(req.body.target || '').trim();
+      const repetitions = Math.min(20, Math.max(1, Number(req.body.repetitions || 4)));
+      const timeout = Math.min(30000, Math.max(1000, Number(req.body.timeout || 5000)));
+      const interfacePath = String(req.body.interfacePath || '').trim();
+      if (!['ping', 'traceroute', 'dns'].includes(type)) {
+        return res.status(400).json({ success: false, error: 'type must be ping, traceroute, or dns' });
+      }
+      if (!target || target.length > 253 || !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?|(?:\d{1,3}\.){3}\d{1,3})$/i.test(target)) {
+        return res.status(400).json({ success: false, error: 'A valid IP address or hostname is required' });
+      }
+      if (interfacePath && !/^(?:InternetGatewayDevice\.WANDevice\.\d+\.WANConnectionDevice\.\d+\.(?:WANPPPConnection|WANIPConnection)\.\d+|Device\.(?:PPP|IP)\.Interface\.\d+)$/.test(interfacePath)) {
+        return res.status(400).json({ success: false, error: 'Invalid WAN interface path' });
+      }
+      const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, req.ispId);
+      const result = await client.runDiagnostic(serialNumber, { type, target, repetitions, timeout, interfacePath });
+      invalidateGenieACSResponseCache(req.ispId, serialNumber);
+      return res.status(202).json({ success: true, data: result });
+    } catch (error) {
+      console.error('Error running GenieACS diagnostic:', error);
+      return this.sendGenieACSError(res, error, 'Failed to queue diagnostic');
+    }
+  }
+
+  async getGenieACSDiagnosticResult(req, res) {
+    try {
+      const { serialNumber } = req.params;
+      const type = String(req.query.type || '').toLowerCase();
+      const dataModel = String(req.query.dataModel || 'TR-098').toUpperCase();
+      const taskId = String(req.query.taskId || '').trim();
+      if (!['ping', 'traceroute', 'dns'].includes(type)) {
+        return res.status(400).json({ success: false, error: 'type must be ping, traceroute, or dns' });
+      }
+      if (!['TR-098', 'TR-181'].includes(dataModel)) {
+        return res.status(400).json({ success: false, error: 'dataModel must be TR-098 or TR-181' });
+      }
+      if (taskId && !/^[a-f0-9]{24}$/i.test(taskId)) {
+        return res.status(400).json({ success: false, error: 'taskId must be a valid GenieACS task ID' });
+      }
+      const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, req.ispId);
+      const data = await client.getDiagnosticResult(serialNumber, {
+        type,
+        dataModel,
+        taskId,
+        refresh: String(req.query.refresh || '').toLowerCase() === 'true'
+      });
+      return res.json({ success: true, data });
+    } catch (error) {
+      console.error('Error reading GenieACS diagnostic result:', error);
+      return this.sendGenieACSError(res, error, 'Failed to read diagnostic result');
     }
   }
 
@@ -4325,6 +4946,11 @@ class ServiceController {
         ssid: ssid || 'KISAN_NET',
         passphrase: password || 'kisan@12345'
       });
+      await this.patchStoredWifiSnapshot(ispId, serialNumber, {
+        ssidIndex: 1,
+        ssidName: ssid || 'KISAN_NET',
+        password: password || 'kisan@12345'
+      });
 
       return res.json({ success: true, data: result });
     } catch (error) {
@@ -4349,6 +4975,7 @@ class ServiceController {
         }
         throw err;
       });
+      await this.patchStoredWifiSnapshot(ispId, serialNumber, { password, allPasswords: true });
       return res.json({ success: true, data: result });
     } catch (error) {
       console.error('Error configuring GenieACS WiFi:', error);
@@ -4373,6 +5000,12 @@ class ServiceController {
 
       const client = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, ispId);
       const result = await client.updateSpecificSSID(serialNumber, Number(resolvedSsidIndex), password, ssidName);
+      await this.patchStoredWifiSnapshot(ispId, serialNumber, {
+        ssidIndex: Number(resolvedSsidIndex),
+        instance,
+        ssidName,
+        password
+      });
 
       const customer = await this.findCustomerForSerial(serialNumber, req);
       if (customer) {
@@ -5641,4 +6274,12 @@ class ServiceController {
 
 }
 
-module.exports = { ServiceController };
+module.exports = {
+  ServiceController,
+  collectTR069ParameterMetadata,
+  extractWifiPassword,
+  isUsableWifiPassword,
+  mergeWifiSnapshotPasswords,
+  mergeConnectedDeviceRecords,
+  normalizeReportedSignal
+};

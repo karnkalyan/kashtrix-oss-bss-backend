@@ -15,6 +15,20 @@ module.exports = (prisma) => {
     router.post('/esewa/base64', auth, checkPermission('settings_update'), settingsController.generateEsewaBase64);
     router.get('/esewa/config', auth, checkPermission('settings_read'), settingsController.getEsewaConfiguration);
     router.put('/esewa/config', auth, checkPermission('settings_update'), settingsController.saveEsewaConfiguration);
+    router.get('/whatsapp', auth, checkPermission('settings_read'), settingsController.getWhatsAppSettings);
+    router.post('/whatsapp', auth, checkPermission('settings_update'), settingsController.updateWhatsAppSettings);
+    router.post('/whatsapp/qr/generate', auth, checkPermission('settings_update'), settingsController.generateWhatsAppQr);
+    router.post('/whatsapp/qr/disconnect', auth, checkPermission('settings_update'), settingsController.disconnectWhatsAppQr);
+    router.post('/whatsapp/qr/scan-simulate', auth, checkPermission('settings_update'), settingsController.simulateWhatsAppQrScan);
+    router.get('/whatsapp/chats', auth, checkPermission('settings_read'), settingsController.listWhatsAppChats);
+    router.get('/whatsapp/chats/:phone/messages', auth, checkPermission('settings_read'), settingsController.getWhatsAppChatMessages);
+    router.post('/whatsapp/chats/:phone/messages', auth, checkPermission('settings_update'), settingsController.sendWhatsAppChatMessage);
+    router.get('/whatsapp/automation', auth, checkPermission('settings_read'), settingsController.listWhatsAppAutomationRules);
+    router.post('/whatsapp/automation', auth, checkPermission('settings_update'), settingsController.saveWhatsAppAutomationRule);
+    router.delete('/whatsapp/automation/:id', auth, checkPermission('settings_update'), settingsController.deleteWhatsAppAutomationRule);
+    router.get('/database-backup', auth, checkPermission('settings_read'), settingsController.getDatabaseBackupSettings);
+    router.put('/database-backup', auth, checkPermission('settings_update'), settingsController.updateDatabaseBackupSettings);
+    router.post('/database-backup/run', auth, checkPermission('settings_update'), settingsController.runDatabaseBackupNow);
     router.post('/', auth, checkPermission('settings_update'), settingsController.updateSetting);
     router.post('/batch', auth, checkPermission('settings_update'), settingsController.batchUpdateSettings);
 

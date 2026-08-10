@@ -70,6 +70,7 @@ class RadiusClient {
     console.log(`[RADIUS] Creating client for baseUrl: ${baseUrl}, username: ${username}`);
 
     return new RadiusClient({
+      ispId: Number(ispId),
       baseUrl: baseUrl,
       username: username,
       password: password,
@@ -221,18 +222,31 @@ class RadiusClient {
         timeout: 10000
       };
 
-      if (method.toLowerCase() === 'get' && externalData) {
-        config.params = externalData;
+      if (['get', 'delete'].includes(method.toLowerCase())) {
+        config.params = { ...(externalData || {}), ispId: this.#config.ispId };
       }
 
-      if (['post', 'put', 'patch'].includes(method.toLowerCase()) && externalData) {
-        config.data = externalData;
+      if (['post', 'put', 'patch'].includes(method.toLowerCase())) {
+        config.data = { ...(externalData || {}), ispId: this.#config.ispId };
       }
 
       const response = await this.#api.request(config);
+      const tableMatch = config.url.match(/^\/api\/(radcheck|radreply|radusergroup|radgroupreply|radgroupcheck|radacct|radpostauth|nasreload|nas)(?:\/|\?|$)/i);
+      if (method.toLowerCase() === 'get' && tableMatch) {
+        const payload = response.data;
+        if (Array.isArray(payload)) return payload.filter((row) => this.#rowBelongsToIsp(row));
+        if (payload && Array.isArray(payload.rows)) return { ...payload, rows: payload.rows.filter((row) => this.#rowBelongsToIsp(row)) };
+        if (payload && Array.isArray(payload.data)) return { ...payload, data: payload.data.filter((row) => this.#rowBelongsToIsp(row)) };
+        if (payload && typeof payload === 'object' && !this.#rowBelongsToIsp(payload)) {
+          const tenantError = new Error('Radius record was not found for the authenticated ISP');
+          tenantError.statusCode = 404;
+          throw tenantError;
+        }
+      }
       return response.data;
 
     } catch (error) {
+      if (error.statusCode) throw error;
       console.error(`[RADIUS API ERROR] ${method} ${endpoint}:`, {
         status: error.response?.status,
         data: error.response?.data,
@@ -593,18 +607,62 @@ class RadiusClient {
     }
 
     const rows = await loader();
-    const list = Array.isArray(rows) ? rows : [];
+    const rawList = Array.isArray(rows) ? rows : [];
+    const list = rawList.filter((row) => this.#rowBelongsToIsp(row));
     const start = Math.max(Number(offset) || 0, 0);
     const safeLimit = Math.min(Math.max(Number(limit) || 500, 1), 2000);
 
     return {
       table,
+      ispId: this.#config.ispId,
       rows: list.slice(start, start + safeLimit),
       total: list.length,
       limit: safeLimit,
       offset: start,
       hasMore: start + safeLimit < list.length
     };
+  }
+
+  #rowBelongsToIsp(row) {
+    if (!row || typeof row !== 'object') return false;
+    const tenantValue = row.ispId ?? row.ispid ?? row.isp_id ?? row.ISP_ID;
+    return tenantValue !== undefined && Number(tenantValue) === Number(this.#config.ispId);
+  }
+
+  #editableTable(table) {
+    const normalized = String(table || '').toLowerCase();
+    const editable = new Set(['radcheck', 'radreply', 'radusergroup', 'radgroupreply', 'radgroupcheck', 'nas']);
+    if (!editable.has(normalized)) {
+      throw new Error('This Radius table is read-only or unsupported');
+    }
+    return normalized;
+  }
+
+  async createTableRow(table, data) {
+    const normalized = this.#editableTable(table);
+    return this.#apiRequest('post', `/api/${normalized}`, { ...(data || {}), ispId: this.#config.ispId });
+  }
+
+  async updateTableRow(table, id, data) {
+    const normalized = this.#editableTable(table);
+    await this.#assertTableRowOwned(normalized, id);
+    return this.#apiRequest('put', `/api/${normalized}/${encodeURIComponent(id)}`, { ...(data || {}), ispId: this.#config.ispId });
+  }
+
+  async deleteTableRow(table, id) {
+    const normalized = this.#editableTable(table);
+    await this.#assertTableRowOwned(normalized, id);
+    return this.#apiRequest('delete', `/api/${normalized}/${encodeURIComponent(id)}`);
+  }
+
+  async #assertTableRowOwned(table, id) {
+    const result = await this.getTable(table, 2000, 0);
+    const owned = result.rows.some((row) => String(row.id ?? row.ID) === String(id));
+    if (!owned) {
+      const error = new Error('Radius record was not found for the authenticated ISP');
+      error.statusCode = 404;
+      throw error;
+    }
   }
 
   // Get radacct by ID

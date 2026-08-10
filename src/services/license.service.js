@@ -7,10 +7,20 @@ const LICENSE_TOKEN_KEY = 'appLicenseToken';
 const LICENSE_HWID_KEY = 'appHardwareFingerprint';
 const LICENSE_SECRET = process.env.LICENSE_SECRET || process.env.ACCESS_SECRET || 'SimulcastLicenseSecretChangeMe';
 const ISSUER = 'Simulcast Technologies Pvt Ltd';
-const EXPIRED_MESSAGE = 'Your license has been expired. Contact Simulcast Technologies Pvt Ltd.';
+const EXPIRED_MESSAGE = 'Your license has expired. Contact Kashtrix at info@kashtrix.com.';
 const ACTIVE_STATUS = 'ACTIVE';
 const BLOCKED_STATUSES = new Set(['INACTIVE', 'DEACTIVE', 'DEACTIVATED', 'STOLEN', 'REVOKED']);
 const ENCRYPTION_ALGORITHM = 'aes-256-gcm';
+
+function normalizeIspId(ispId) {
+  const value = Number(ispId || process.env.DEFAULT_ISP_ID || 1);
+  if (!Number.isInteger(value) || value <= 0) throw new Error('A valid ISP ID is required for licensing');
+  return value;
+}
+
+function tenantSettingKey(baseKey, ispId) {
+  return `${baseKey}:${normalizeIspId(ispId)}`;
+}
 
 function readFirstExistingFile(paths) {
   for (const filePath of paths) {
@@ -64,54 +74,25 @@ function getRuntimeHardwareFingerprint() {
   return hashHardwareSeed(raw);
 }
 
-async function getHardwareFingerprint(prisma) {
-  if (process.env.LICENSE_HARDWARE_ID) {
-    return getRuntimeHardwareFingerprint();
-  }
-
-  if (!prisma) {
-    return getRuntimeHardwareFingerprint();
-  }
-
-  const stored = await prisma.iSPSettings.findUnique({ where: { key: LICENSE_HWID_KEY } });
-  if (stored?.value) return stored.value;
-
-  const existingTokenSetting = await prisma.iSPSettings.findUnique({ where: { key: LICENSE_TOKEN_KEY } });
-  if (existingTokenSetting?.value) {
-    const decoded = jwt.decode(existingTokenSetting.value);
-    if (decoded?.aud && typeof decoded.aud === 'string') {
-      await prisma.iSPSettings.upsert({
-        where: { key: LICENSE_HWID_KEY },
-        update: {
-          value: decoded.aud,
-          description: 'Stable application hardware fingerprint',
-          updatedAt: new Date()
-        },
-        create: {
-          ispId: Number(process.env.DEFAULT_ISP_ID || 1),
-          key: LICENSE_HWID_KEY,
-          value: decoded.aud,
-          description: 'Stable application hardware fingerprint',
-          updatedAt: new Date()
-        }
-      });
-      return decoded.aud;
-    }
-  }
-
-  const hwid = getRuntimeHardwareFingerprint();
+async function getHardwareFingerprint(prisma, ispId) {
+  const tenantId = normalizeIspId(ispId);
+  // Deterministic and hardware-bound: the same host + ISP always yields the
+  // same ID, while two ISPs on the same host never share an ID.
+  const hwid = hashHardwareSeed(`${getRuntimeHardwareFingerprint()}::isp::${tenantId}`);
+  if (!prisma) return hwid;
+  const key = tenantSettingKey(LICENSE_HWID_KEY, tenantId);
   await prisma.iSPSettings.upsert({
-    where: { key: LICENSE_HWID_KEY },
+    where: { key },
     update: {
       value: hwid,
-      description: 'Stable application hardware fingerprint',
+      description: `Deterministic hardware fingerprint for ISP ${tenantId}`,
       updatedAt: new Date()
     },
     create: {
-      ispId: Number(process.env.DEFAULT_ISP_ID || 1),
-      key: LICENSE_HWID_KEY,
+      ispId: tenantId,
+      key,
       value: hwid,
-      description: 'Stable application hardware fingerprint',
+      description: `Deterministic hardware fingerprint for ISP ${tenantId}`,
       updatedAt: new Date()
     }
   });
@@ -119,8 +100,8 @@ async function getHardwareFingerprint(prisma) {
   return hwid;
 }
 
-async function getStoredToken(prisma) {
-  const setting = await prisma.iSPSettings.findUnique({ where: { key: LICENSE_TOKEN_KEY } });
+async function getStoredToken(prisma, ispId) {
+  const setting = await prisma.iSPSettings.findUnique({ where: { key: tenantSettingKey(LICENSE_TOKEN_KEY, ispId) } });
   return setting?.value || null;
 }
 
@@ -181,7 +162,8 @@ function sanitizeLicenseRecord(record) {
 }
 
 async function saveToken(prisma, ispId, token) {
-  const status = await verifyToken(prisma, token);
+  const tenantId = normalizeIspId(ispId);
+  const status = await verifyToken(prisma, token, tenantId);
   if (!status.active) {
     const error = new Error(status.message || EXPIRED_MESSAGE);
     error.status = 402;
@@ -192,20 +174,20 @@ async function saveToken(prisma, ispId, token) {
     where: { tokenHash: hashToken(token) },
     data: {
       installedAt: new Date(),
-      installedIspId: ispId || Number(process.env.DEFAULT_ISP_ID || 1)
+      installedIspId: tenantId
     }
   });
 
   return prisma.iSPSettings.upsert({
-    where: { key: LICENSE_TOKEN_KEY },
+    where: { key: tenantSettingKey(LICENSE_TOKEN_KEY, tenantId) },
     update: {
       value: token,
       description: 'Application license JWT',
       updatedAt: new Date()
     },
     create: {
-      ispId: ispId || Number(process.env.DEFAULT_ISP_ID || 1),
-      key: LICENSE_TOKEN_KEY,
+      ispId: tenantId,
+      key: tenantSettingKey(LICENSE_TOKEN_KEY, tenantId),
       value: token,
       description: 'Application license JWT',
       updatedAt: new Date()
@@ -213,12 +195,13 @@ async function saveToken(prisma, ispId, token) {
   });
 }
 
-async function deleteToken(prisma) {
-  await prisma.iSPSettings.deleteMany({ where: { key: LICENSE_TOKEN_KEY } });
+async function deleteToken(prisma, ispId) {
+  await prisma.iSPSettings.deleteMany({ where: { key: tenantSettingKey(LICENSE_TOKEN_KEY, ispId) } });
 }
 
-async function verifyToken(prisma, token) {
-  const hwid = await getHardwareFingerprint(prisma);
+async function verifyToken(prisma, token, ispId) {
+  const tenantId = normalizeIspId(ispId);
+  const hwid = await getHardwareFingerprint(prisma, tenantId);
   const decoded = jwt.verify(token, LICENSE_SECRET, {
     issuer: ISSUER,
     audience: hwid
@@ -240,6 +223,12 @@ async function verifyToken(prisma, token) {
 
   if (storedLicense.hwid !== hwid) {
     const error = new Error('License key is not valid for this hardware ID.');
+    error.status = 402;
+    throw error;
+  }
+
+  if (storedLicense.installedIspId && storedLicense.installedIspId !== tenantId) {
+    const error = new Error('License key is installed for a different ISP tenant.');
     error.status = 402;
     throw error;
   }
@@ -271,9 +260,10 @@ async function verifyToken(prisma, token) {
   };
 }
 
-async function getStatus(prisma) {
-  const hwid = await getHardwareFingerprint(prisma);
-  const token = await getStoredToken(prisma);
+async function getStatus(prisma, ispId) {
+  const tenantId = normalizeIspId(ispId);
+  const hwid = await getHardwareFingerprint(prisma, tenantId);
+  const token = await getStoredToken(prisma, tenantId);
 
   if (!token) {
     return {
@@ -287,7 +277,7 @@ async function getStatus(prisma) {
   try {
     return {
       configured: true,
-      ...(await verifyToken(prisma, token))
+      ...(await verifyToken(prisma, token, tenantId))
     };
   } catch (error) {
     return {
@@ -300,8 +290,11 @@ async function getStatus(prisma) {
   }
 }
 
-async function generateLicense(prisma, { company, contact, expiresAt, licenseId, hwid }, user) {
-  const targetHwid = hwid || await getHardwareFingerprint(prisma);
+async function generateLicense(prisma, { company, contact, expiresAt, licenseId, ispId }, user) {
+  const tenantId = normalizeIspId(ispId || user?.ispId);
+  const tenant = await prisma.iSP.findUnique({ where: { id: tenantId }, select: { id: true } });
+  if (!tenant) throw new Error('The selected ISP tenant does not exist');
+  const targetHwid = await getHardwareFingerprint(prisma, tenantId);
   if (!company) throw new Error('Company is required');
   if (!targetHwid) throw new Error('Hardware ID is required');
   if (!expiresAt) throw new Error('Expire date is required');
@@ -420,7 +413,18 @@ function licenseGuard(prisma) {
       return next();
     }
 
-    const status = await getStatus(prisma);
+    let ispId = Number(process.env.DEFAULT_ISP_ID || 1);
+    const token = req.cookies?.access_token || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
+    if (token && process.env.ACCESS_SECRET) {
+      try {
+        const payload = jwt.verify(token, process.env.ACCESS_SECRET);
+        const user = await prisma.user.findUnique({ where: { id: payload.userId }, select: { ispId: true } });
+        if (user?.ispId) ispId = user.ispId;
+      } catch {
+        // Authentication middleware will return the appropriate auth error.
+      }
+    }
+    const status = await getStatus(prisma, ispId);
     if (!status.active) {
       return res.status(402).json({
         success: false,

@@ -34,7 +34,8 @@ async function listOlts(req, res, next) {
     const where = {
       isDeleted: false,
       ispId: req.ispId,
-      ...branchFilter
+      ...branchFilter,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     if (status && status !== 'all') where.status = status;
@@ -161,6 +162,8 @@ async function listOlts(req, res, next) {
       return {
         id: olt.id.toString(),
         name: olt.name,
+        branchId: olt.branchId,
+        resellerId: olt.resellerId,
         ipAddress: olt.ipAddress,
         model: olt.model,
         vendor: olt.vendor,
@@ -213,7 +216,8 @@ async function getOltById(req, res, next) {
         id,
         isDeleted: false,
         ispId: req.ispId,
-        ...branchFilter
+        ...branchFilter,
+        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
       },
       include: {
         serviceBoards: {
@@ -318,6 +322,8 @@ async function getOltById(req, res, next) {
       data: {
         id: olt.id.toString(),
         name: olt.name,
+        branchId: olt.branchId,
+        resellerId: olt.resellerId,
         ipAddress: olt.ipAddress,
         model: olt.model,
         vendor: olt.vendor,
@@ -420,7 +426,8 @@ async function createOlt(req, res, next) {
       backupSchedule = "none",
       notes,
       defaultTransport = "ssh",
-      branchId
+      branchId,
+      resellerId
     } = req.body;
 
     // Validation
@@ -434,6 +441,23 @@ async function createOlt(req, res, next) {
     const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
     if (!ipRegex.test(ipAddress)) {
       return res.status(400).json({ error: "Invalid IP address format" });
+    }
+    if (branchId && resellerId) {
+      return res.status(400).json({ error: "Assign an OLT to either a branch or a reseller, not both" });
+    }
+    if (branchId) {
+      const branch = await req.prisma.branch.findFirst({
+        where: { id: Number(branchId), ispId: Number(req.ispId), isDeleted: false },
+        select: { id: true }
+      });
+      if (!branch) return res.status(400).json({ error: "Selected branch is invalid" });
+    }
+    if (resellerId) {
+      const reseller = await req.prisma.reseller.findFirst({
+        where: { id: Number(resellerId), ispId: Number(req.ispId), isDeleted: false, isActive: true },
+        select: { id: true }
+      });
+      if (!reseller) return res.status(400).json({ error: "Selected reseller is invalid" });
     }
 
     // Check if OLT with same IP already exists for this ISP
@@ -512,7 +536,8 @@ async function createOlt(req, res, next) {
           notes: notes || null,
           ispId: req.ispId,
           defaultTransport,
-          branchId: finalBranchId
+          branchId: resellerId ? null : finalBranchId,
+          resellerId: resellerId ? Number(resellerId) : null
         }
       });
 
@@ -553,6 +578,8 @@ async function createOlt(req, res, next) {
       data: {
         id: result.id.toString(),
         name: result.name,
+        branchId: result.branchId,
+        resellerId: result.resellerId,
         ipAddress: result.ipAddress,
         model: result.model,
         vendor: result.vendor,
@@ -824,6 +851,8 @@ async function updateOlt(req, res, next) {
       data: {
         id: result.id.toString(),
         name: result.name,
+        branchId: result.branchId,
+        resellerId: result.resellerId,
         ipAddress: result.ipAddress,
         model: result.model,
         vendor: result.vendor,
@@ -1375,6 +1404,7 @@ async function getOntsForOlt(req, res, next) {
 
     const where = {
       oltId: oltId,
+      ispId: req.ispId,
       isDeleted: false
     };
 
@@ -4127,6 +4157,149 @@ async function deleteOltLoadFile(req, res, next) {
 }
 
 
+/**
+ * Find F/S/P (frame/slot/port) from a MAC address on an OLT or all OLTs.
+ * POST /olt/:id/find-fsp-by-mac  body: { macAddress }
+ * If :id is 'all', searches all active OLTs for this ISP.
+ */
+async function findFSPByMac(req, res, next) {
+  try {
+    const { macAddress } = req.body;
+    if (!macAddress) return res.status(400).json({ error: 'macAddress is required' });
+    const { normalizeMac } = require('../utils/macAddress');
+    const canonicalMac = normalizeMac(macAddress, 'colon');
+
+    const oltIdParam = req.params.id;
+    const isSearchAll = oltIdParam === 'all';
+
+    let oltsToSearch = [];
+    if (isSearchAll) {
+      oltsToSearch = await req.prisma.oLT.findMany({
+        where: { ispId: req.ispId, isDeleted: false, isActive: true }
+      });
+    } else {
+      const olt = await req.prisma.oLT.findFirst({
+        where: { id: Number(oltIdParam), ispId: req.ispId, isDeleted: false }
+      });
+      if (!olt) return res.status(404).json({ error: 'OLT not found' });
+      oltsToSearch = [olt];
+    }
+
+    const outcomes = await Promise.all(oltsToSearch.map(async (olt) => {
+      let driver;
+      try {
+        driver = getDriver(olt);
+        if (!driver || typeof driver.findFSPByMac !== 'function') {
+          return { oltId: olt.id, error: { code: 'OLT_MAC_LOOKUP_UNSUPPORTED', message: 'This OLT driver does not support MAC lookup' } };
+        }
+
+        await driver.connect();
+        const results = await driver.findFSPByMac(canonicalMac);
+        return {
+            oltId: olt.id,
+            oltName: olt.name,
+            oltIp: olt.ipAddress,
+            oltVendor: olt.vendor,
+            matches: (results || []).map(match => ({
+              ...match,
+              oltId: olt.id,
+              oltName: olt.name,
+              oltHost: olt.ipAddress,
+              vendor: olt.vendor,
+              originalMac: macAddress,
+              normalizedMac: match.normalizedMac || canonicalMac,
+            }))
+        };
+      } catch (err) {
+        return {
+          oltId: olt.id,
+          oltName: olt.name,
+          error: {
+            code: err.code || (/auth|password|permission|privilege/i.test(err.message) ? 'OLT_AUTHORIZATION_FAILED' : 'OLT_LOOKUP_FAILED'),
+            message: /auth|password|permission|privilege/i.test(err.message)
+              ? 'OLT authentication or privilege check failed'
+              : 'OLT lookup failed or timed out',
+          },
+        };
+      } finally {
+        try {
+          if (typeof driver?.ssh?.disconnect === 'function') await driver.ssh.disconnect();
+          else driver?.ssh?.close?.();
+        } catch { /* connection cleanup is best effort */ }
+      }
+    }));
+    const allResults = outcomes.filter(result => Array.isArray(result.matches) && result.matches.length);
+    const errors = outcomes.filter(result => result.error);
+
+    return res.json({
+      success: true,
+      macAddress: canonicalMac,
+      totalMatches: allResults.reduce((sum, r) => sum + r.matches.length, 0),
+      multipleMatches: allResults.reduce((sum, r) => sum + r.matches.length, 0) > 1,
+      results: allResults,
+      errors,
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+async function linkCustomerDeviceToOLT(req, res, next) {
+  try {
+    const oltId = Number(req.params.id);
+    const customerId = Number(req.body.customerId);
+    const customerDeviceId = req.body.customerDeviceId ? Number(req.body.customerDeviceId) : null;
+    const { fsp, vlan, ontId, macAddress, replaceExisting = false } = req.body;
+    if (!customerId || !/^\d+\/\d+\/\d+$/.test(String(fsp || ''))) {
+      return res.status(400).json({ success: false, error: 'customerId and a valid frame/slot/port are required' });
+    }
+    const [olt, customer, selectedDevice] = await Promise.all([
+      req.prisma.oLT.findFirst({ where: { id: oltId, ispId: Number(req.ispId), isDeleted: false } }),
+      req.prisma.customer.findFirst({ where: { id: customerId, ispId: Number(req.ispId), isDeleted: false } }),
+      customerDeviceId ? req.prisma.customerDevice.findFirst({ where: { id: customerDeviceId, customerId } }) : Promise.resolve(null),
+    ]);
+    if (!olt || !customer || (customerDeviceId && !selectedDevice)) {
+      return res.status(404).json({ success: false, error: 'OLT, customer, or customer device not found' });
+    }
+    const existing = await req.prisma.customerServiceConnection.findFirst({
+      where: { customerId, status: { not: 'deleted' } }, orderBy: { updatedAt: 'desc' },
+    });
+    const conflict = existing && (existing.oltId !== oltId || existing.oltPort !== String(fsp));
+    if (conflict && !replaceExisting) {
+      return res.status(409).json({
+        success: false,
+        error: 'Customer already has a different OLT mapping. Confirm replacement explicitly.',
+        code: 'OLT_MAPPING_CONFLICT',
+        existing: { id: existing.id, oltId: existing.oltId, oltPort: existing.oltPort, vlanId: existing.vlanId },
+      });
+    }
+    const mapping = await req.prisma.$transaction(async tx => {
+      const saved = existing
+        ? await tx.customerServiceConnection.update({ where: { id: existing.id }, data: {
+          oltId, oltPort: String(fsp), vlanId: vlan == null ? null : String(vlan),
+          status: 'active', provisioningNotes: `Discovered from MAC ${macAddress || 'unknown'}; ONT ID ${ontId ?? 'unknown'}`,
+        } })
+        : await tx.customerServiceConnection.create({ data: {
+          customerId, oltId, oltPort: String(fsp), vlanId: vlan == null ? null : String(vlan),
+          status: 'active', connectionType: 'fiber',
+          provisioningNotes: `Discovered from MAC ${macAddress || 'unknown'}; ONT ID ${ontId ?? 'unknown'}`,
+        } });
+      if (selectedDevice) await tx.customerDevice.update({ where: { id: selectedDevice.id }, data: {
+        macAddress: macAddress || selectedDevice.macAddress, ponSerial: selectedDevice.ponSerial || (ontId == null ? null : String(ontId)),
+        provisioningStatus: 'active',
+      } });
+      await tx.auditLog.create({ data: {
+        ispId: Number(req.ispId), branchId: req.branchId || null, userId: req.user.id,
+        action: 'CUSTOMER_OLT_MAPPING_CHANGED',
+        details: JSON.stringify({ customerId, customerDeviceId, before: existing, after: saved, discoveredMac: macAddress }),
+        ip: req.ip,
+      } });
+      return saved;
+    });
+    return res.json({ success: true, data: mapping });
+  } catch (error) { return next(error); }
+}
+
 module.exports = {
   listOlts,
   getOltById,
@@ -4160,5 +4333,7 @@ module.exports = {
   getActiveSessions,
   getOltLoadFiles,
   createOltLoadFile,
-  deleteOltLoadFile
+  deleteOltLoadFile,
+  findFSPByMac,
+  linkCustomerDeviceToOLT
 };

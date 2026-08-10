@@ -23,6 +23,52 @@ async function syncPaidOrderAccounting(prisma, ispId, orderId) {
     }
 }
 
+async function debitResellerWallet(tx, {
+    ispId, resellerId, amount, customerId, invoiceId, orderId, userId, action
+}) {
+    const debitAmount = Number(amount);
+    if (!resellerId || !Number.isFinite(debitAmount) || debitAmount <= 0) return null;
+    const wallet = await tx.wallet.findFirst({
+        where: { ispId: Number(ispId), resellerId: Number(resellerId) }
+    });
+    if (!wallet) throw Object.assign(new Error('Reseller wallet is not configured'), { status: 409 });
+    const idempotencyKey = `${action}:${orderId}`;
+    const existing = await tx.walletTransaction.findUnique({
+        where: { walletId_idempotencyKey: { walletId: wallet.id, idempotencyKey } }
+    });
+    if (existing) return existing;
+    const changed = await tx.wallet.updateMany({
+        where: {
+            id: wallet.id,
+            balance: { gte: wallet.reservedBalance.plus(debitAmount) }
+        },
+        data: { balance: { decrement: debitAmount } }
+    });
+    if (changed.count !== 1) {
+        throw Object.assign(new Error('Insufficient reseller wallet balance'), {
+            status: 409,
+            code: 'INSUFFICIENT_WALLET_BALANCE'
+        });
+    }
+    const updated = await tx.wallet.findUnique({ where: { id: wallet.id } });
+    return tx.walletTransaction.create({
+        data: {
+            walletId: wallet.id,
+            type: 'DEBIT',
+            amount: debitAmount.toFixed(2),
+            balanceAfter: updated.balance,
+            description: action === 'RENEWAL' ? 'Customer package renewal' : 'Invoice payment',
+            reference: `ORDER-${orderId}`,
+            idempotencyKey,
+            createdById: userId || null,
+            relatedCustomerId: Number(customerId),
+            relatedInvoiceId: invoiceId ? String(invoiceId) : null,
+            resellerId: Number(resellerId),
+            metadata: { action, orderId: Number(orderId), paymentSource: 'RESELLER_WALLET' }
+        }
+    });
+}
+
 async function syncRadiusExpirationAndDisconnect(ispId, connectionUsers, expiration, context) {
     const users = (connectionUsers || []).filter(user => user?.username && user.isDeleted !== true && user.isActive !== false);
     if (!users.length) {
@@ -99,23 +145,29 @@ async function syncRadiusExpirationAndDisconnect(ispId, connectionUsers, expirat
 }
 
 function getRenewalBase(subscription, now = new Date()) {
+    if (!subscription) return now;
     const planEnd = subscription?.planEnd ? new Date(subscription.planEnd) : now;
     const graceDays = Math.max(0, Number(subscription?.graceDaysBalance || 0));
     const adminDays = Math.max(0, Number(subscription?.adminExtensionDays || 0));
     const deductibleDays = graceDays + adminDays;
     const expiryBeforeExtension = new Date(planEnd);
     expiryBeforeExtension.setDate(expiryBeforeExtension.getDate() - deductibleDays);
+    expiryBeforeExtension.setHours(0, 0, 0, 0);
     if (deductibleDays > 0) return expiryBeforeExtension;
-    return planEnd >= now ? planEnd : now;
+    const result = planEnd >= now ? planEnd : now;
+    result.setHours(0, 0, 0, 0);
+    return result;
 }
 
 async function getRenewalWindow(prisma, ispId, subscription) {
     const now = new Date();
-    if (!subscription?.isTrial) return { planStart: getRenewalBase(subscription, now), trialDeductionDays: 0 };
+    if (!subscription) return { planStart: now, trialDeductionDays: 0 };
+    const baseStart = getRenewalBase(subscription, now);
+    if (!subscription.isTrial) return { planStart: baseStart, trialDeductionDays: 0 };
     const setting = await prisma.iSPSettings.findFirst({ where: { ispId: Number(ispId), key: 'trialDeductionOnSubscriptionActivation' } });
     const deductTrial = setting?.value === 'true';
     const trialMs = Math.max(0, new Date(subscription.planEnd) - new Date(subscription.planStart));
-    return { planStart: now, trialDeductionDays: deductTrial ? Math.ceil(trialMs / 86400000) : 0 };
+    return { planStart: baseStart, trialDeductionDays: deductTrial ? Math.ceil(trialMs / 86400000) : 0 };
 }
 
 async function resolveActiveFiscalYear(prisma, ispId, fiscalYearId) {
@@ -153,7 +205,7 @@ async function extendSubscription(req, res, next) {
             where: { 
                 customerId: Number(customerId), 
                 isActive: true,
-                customer: { ispId: req.ispId, ...(req.branchId ? { branchId: req.branchId } : {}) }
+                customer: { ispId: req.ispId, ...(req.branchId ? { branchId: req.branchId } : {}), ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {}) }
             },
             include: { customer: { include: { connectionUsers: true } } },
             orderBy: { createdAt: 'desc' }
@@ -292,7 +344,7 @@ async function togglePause(req, res, next) {
             where: { 
                 customerId: Number(customerId), 
                 isActive: true,
-                customer: { ispId: req.ispId, ...(req.branchId ? { branchId: req.branchId } : {}) }
+                customer: { ispId: req.ispId, ...(req.branchId ? { branchId: req.branchId } : {}), ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {}) }
             },
             include: { customer: { include: { connectionUsers: true } } },
             orderBy: { createdAt: 'desc' }
@@ -468,9 +520,10 @@ async function payOrder(req, res, next) {
                 id: order.customerId, 
                 ispId: req.ispId, 
                 isDeleted: false,
-                ...(req.branchId ? { branchId: req.branchId } : {})
+                ...(req.branchId ? { branchId: req.branchId } : {}),
+                ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
             },
-            select: { id: true, branchId: true }
+            select: { id: true, branchId: true, resellerId: true }
         });
 
         if (!customer) return res.status(404).json({ error: 'Customer not found' });
@@ -521,16 +574,29 @@ async function payOrder(req, res, next) {
             }
         }
 
-        const updatedOrder = await prisma.customerOrderManagement.update({
-            where: { id: order.id },
-            data: {
-                isPaid: true,
-                invoiceId: invoiceId.toString(),
-                paymentId: paymentMethodRecord ? paymentMethodRecord.code : (paymentMethod || 'CASH'),
-                fiscalYearId: fiscalYear.id,
-                paymentMethodId: paymentMethodRecord ? paymentMethodRecord.id : undefined,
-                updatedAt: new Date()
-            }
+        const updatedOrder = await prisma.$transaction(async tx => {
+            const paid = await tx.customerOrderManagement.update({
+                where: { id: order.id },
+                data: {
+                    isPaid: true,
+                    invoiceId: invoiceId.toString(),
+                    paymentId: req.user?.resellerId ? 'RESELLER_WALLET' : (paymentMethodRecord ? paymentMethodRecord.code : (paymentMethod || 'CASH')),
+                    fiscalYearId: fiscalYear.id,
+                    paymentMethodId: req.user?.resellerId ? null : (paymentMethodRecord ? paymentMethodRecord.id : undefined),
+                    updatedAt: new Date()
+                }
+            });
+            await debitResellerWallet(tx, {
+                ispId: req.ispId,
+                resellerId: req.user?.resellerId,
+                amount,
+                customerId: customer.id,
+                invoiceId,
+                orderId: order.id,
+                userId: req.user?.id,
+                action: 'INVOICE_PAYMENT'
+            });
+            return paid;
         });
 
         const subscription = await prisma.customerSubscription.findUnique({ where: { id: order.subscriptionId || 0 } });
@@ -601,7 +667,8 @@ async function renewSubscription(req, res, next) {
                 id: Number(customerId), 
                 ispId: req.ispId, 
                 isDeleted: false,
-                ...(req.branchId ? { branchId: req.branchId } : {})
+                ...(req.branchId ? { branchId: req.branchId } : {}),
+                ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
             },
             include: {
                 lead: true
@@ -609,14 +676,24 @@ async function renewSubscription(req, res, next) {
         });
 
         if (!customer) return res.status(404).json({ error: 'Customer not found' });
+        if (req.user?.resellerId) {
+            const assignedPlan = await prisma.packagePlanReseller.findFirst({
+                where: {
+                    packagePlanId: Number(pkgPrice.planId),
+                    resellerId: Number(req.user.resellerId)
+                },
+                select: { id: true }
+            });
+            if (!assignedPlan) return res.status(403).json({ error: 'This package is not assigned to your reseller account' });
+        }
 
         const fiscalYear = await resolveActiveFiscalYear(prisma, req.ispId, fiscalYearId);
         if (!fiscalYear) return res.status(400).json({ error: 'Select the fiscal year that is active for the current date' });
 
-        const paymentMethod = await prisma.billingPaymentMethod.findFirst({
+        const paymentMethod = req.user?.resellerId ? null : await prisma.billingPaymentMethod.findFirst({
             where: { id: Number(paymentMethodId), ispId: req.ispId, isEnabled: true }
         });
-        if (!paymentMethod) return res.status(400).json({ error: 'Select an enabled payment method' });
+        if (!req.user?.resellerId && !paymentMethod) return res.status(400).json({ error: 'Select an enabled payment method' });
 
         const policyBranchId = customer.subBranchId || customer.branchId;
         const branchPolicy = policyBranchId ? await prisma.branch.findFirst({
@@ -729,7 +806,7 @@ async function renewSubscription(req, res, next) {
             }
             orderItems.push(...renewalItems);
 
-            await tx.customerOrderManagement.create({
+            const renewalOrder = await tx.customerOrderManagement.create({
                 data: {
                     customerId: Number(customerId),
                     subscriptionId: created.id,
@@ -738,12 +815,12 @@ async function renewSubscription(req, res, next) {
                     packageStart: planStart,
                     packageEnd: planEnd,
                     totalAmount: amount !== undefined ? Number(amount) : expectedAmount,
-                    isPaid: false,
+                    isPaid: Boolean(req.user?.resellerId),
                     isActive: true,
                     invoiceId: invoiceId ? String(invoiceId) : null,
-                    paymentId: 'PENDING_APPROVAL',
+                    paymentId: req.user?.resellerId ? 'RESELLER_WALLET' : 'PENDING_APPROVAL',
                     fiscalYearId: fiscalYear.id,
-                    paymentMethodId: paymentMethod.id,
+                    paymentMethodId: paymentMethod?.id || null,
                     updatedAt: new Date(),
                     items: {
                         create: orderItems.map(i => ({
@@ -753,6 +830,16 @@ async function renewSubscription(req, res, next) {
                         }))
                     }
                 }
+            });
+            await debitResellerWallet(tx, {
+                ispId: req.ispId,
+                resellerId: req.user?.resellerId,
+                amount: expectedAmount,
+                customerId: customer.id,
+                invoiceId,
+                orderId: renewalOrder.id,
+                userId: req.user?.id,
+                action: 'RENEWAL'
             });
             if (invoiceRange && invoiceId) {
                 await tx.branchInvoiceRange.update({
@@ -883,28 +970,42 @@ async function generateManualInvoice(req, res, next) {
                 id: Number(customerId),
                 ispId: req.ispId,
                 isDeleted: false,
-                ...(req.branchId ? { branchId: req.branchId } : {})
+                ...(req.branchId ? { branchId: req.branchId } : {}),
+                ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
             }
         });
         if (!customer) return res.status(404).json({ error: 'Customer not found or access denied' });
 
         const totalAmount = items.reduce((sum, i) => sum + parseFloat(i.itemPrice || 0), 0);
         
-        const newOrder = await prisma.customerOrderManagement.create({
-            data: {
-                customer: { connect: { id: Number(customerId) } },
-                orderDate: new Date(),
-                totalAmount,
-                isPaid: false,
-                isActive: true,
-                items: {
-                    create: items.map(i => ({
-                        itemName: i.itemName,
-                        itemPrice: parseFloat(i.itemPrice)
-                    }))
-                }
-            },
-            include: { items: true }
+        const newOrder = await prisma.$transaction(async tx => {
+            const order = await tx.customerOrderManagement.create({
+                data: {
+                    customer: { connect: { id: Number(customerId) } },
+                    orderDate: new Date(),
+                    totalAmount,
+                    isPaid: Boolean(req.user?.resellerId),
+                    isActive: true,
+                    paymentId: req.user?.resellerId ? 'RESELLER_WALLET' : null,
+                    items: {
+                        create: items.map(i => ({
+                            itemName: i.itemName,
+                            itemPrice: parseFloat(i.itemPrice)
+                        }))
+                    }
+                },
+                include: { items: true }
+            });
+            await debitResellerWallet(tx, {
+                ispId: req.ispId,
+                resellerId: req.user?.resellerId,
+                amount: totalAmount,
+                customerId: customer.id,
+                orderId: order.id,
+                userId: req.user?.id,
+                action: 'MANUAL_INVOICE'
+            });
+            return order;
         });
 
         res.json(newOrder);
@@ -924,7 +1025,8 @@ async function getBillingStats(req, res, next) {
         const branchFilter = await getBranchFilter(req);
         const customerWhere = {
             ispId: req.ispId,
-            ...(branchFilter?.branchId ? { branchId: branchFilter.branchId } : {})
+            ...(branchFilter?.branchId ? { branchId: branchFilter.branchId } : {}),
+            ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
         };
         const customerIds = await prisma.customer.findMany({
             where: customerWhere,
@@ -989,7 +1091,8 @@ async function listInvoices(req, res, next) {
             isDeleted: false,
             customer: {
                 ispId: req.ispId,
-                ...branchFilter
+                ...branchFilter,
+                ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
             }
         };
 
@@ -1236,7 +1339,8 @@ async function getInvoiceSummary(req, res, next) {
             isDeleted: false,
             customer: {
                 ispId: req.ispId,
-                ...branchFilter
+                ...branchFilter,
+                ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
             }
         };
 
@@ -1308,6 +1412,9 @@ async function getInvoiceSummary(req, res, next) {
 async function listInvoiceRanges(req, res, next) {
     const prisma = req.prisma;
     try {
+        if (req.user?.resellerId) {
+            return res.json({ success: true, ranges: [] });
+        }
         const branches = await prisma.branch.findMany({ where: { ispId: req.ispId, isDeleted: false }, select: { id: true } });
         const ranges = await prisma.branchInvoiceRange.findMany({
             where: { branchId: { in: branches.map(branch => branch.id) } },

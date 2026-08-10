@@ -31,6 +31,16 @@ async function createLead(req, res, next) {
       longitude,
       serviceRadius
     } = req.body;
+    const effectiveResellerId = req.user?.resellerId
+      ? Number(req.user.resellerId)
+      : (req.body.resellerId ? Number(req.body.resellerId) : null);
+    if (effectiveResellerId) {
+      const reseller = await req.prisma.reseller.findFirst({
+        where: { id: effectiveResellerId, ispId: Number(req.ispId), isDeleted: false, isActive: true },
+        select: { id: true }
+      });
+      if (!reseller) return res.status(400).json({ error: 'Invalid reseller assignment' });
+    }
 
     // Validate branch and sub-branch based on global system settings
     const branchValidationSetting = await req.prisma.iSPSettings.findFirst({
@@ -60,6 +70,7 @@ async function createLead(req, res, next) {
       ispId: req.ispId ? Number(req.ispId) : null,
       branchId: branchId ? Number(branchId) : null,
       subBranchId: subBranchId ? Number(subBranchId) : null,
+      resellerId: effectiveResellerId,
       // Optional fields
       middleName: middleName || null,
       secondaryContactNumber: secondaryContactNumber || null,
@@ -153,6 +164,7 @@ const getAllLeads = async (req, res, next) => {
     const where = {
       isDeleted: false,
       ispId: req.ispId || req.user.ispId,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     // ROLE-BASED FILTERING (EXACTLY LIKE FOLLOW-UPS)
@@ -353,7 +365,8 @@ async function getLeadById(req, res, next) {
       where: {
         id: id,
         ispId: req.ispId,
-        isDeleted: false
+        isDeleted: false,
+        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
       },
       include: {
         membership: true,
@@ -497,7 +510,8 @@ async function updateLead(req, res, next) {
       where: {
         id: id,
         ispId: req.ispId,
-        isDeleted: false
+        isDeleted: false,
+        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
       }
     });
 
@@ -841,7 +855,8 @@ async function getConvertedLeads(req, res, next) {
     const where = {
       ispId: req.ispId || req.user.ispId,
       convertedToCustomer: true,
-      isDeleted: false
+      isDeleted: false,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     // Add search functionality (MySQL doesn't support mode: 'insensitive')
@@ -946,6 +961,7 @@ async function importLeadsFromCSV(req, res, next) {
           source: row.source || 'import',
           status: row.status || 'new',
           ispId: req.ispId ? Number(req.ispId) : null,
+          resellerId: req.user?.resellerId ? Number(req.user.resellerId) : null,
           memberShipId: row.memberShipId ? Number(row.memberShipId) : null,
           notes: row.notes || null,
           assignedUserId: row.assignedUserId ? Number(row.assignedUserId) : null,
@@ -965,6 +981,7 @@ async function importLeadsFromCSV(req, res, next) {
           where: {
             OR: [leadData.email ? { email: leadData.email } : {}],
             ispId: req.ispId ? Number(req.ispId) : null,
+            ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {}),
             isDeleted: false
           }
         });
@@ -1044,7 +1061,8 @@ async function getLeadReports(req, res) {
     // Build filter conditions
     const whereConditions = {
       ispId: req.ispId,
-      isDeleted: false
+      isDeleted: false,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     // Add date range filter
@@ -1166,7 +1184,8 @@ async function exportLeadReport(req, res) {
     // Build filter conditions (same as getLeadReports)
     const whereConditions = {
       ispId: req.ispId,
-      isDeleted: false
+      isDeleted: false,
+      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     if (startDate || endDate) {

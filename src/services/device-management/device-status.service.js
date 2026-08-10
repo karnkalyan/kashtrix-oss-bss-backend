@@ -1,8 +1,9 @@
 const {createAdapter}=require('./device-adapter.service');
 const {classifyError}=require('./device-connection.service');
 const {audit}=require('./device-audit.service');
+const TelemetryAlarmService=require('./telemetry-alarm.service');
 class DeviceStatusService{
- constructor(prisma,connections){this.prisma=prisma;this.connections=connections;this.running=new Set();this.timer=null;}
+ constructor(prisma,connections){this.prisma=prisma;this.connections=connections;this.alarms=new TelemetryAlarmService(prisma);this.running=new Set();this.timer=null;}
  async refresh(device,{userId=null,sourceIp=null,auditEvent=true}={}){
   if(this.running.has(device.id))throw Object.assign(new Error('A status check is already running for this device.'),{status:409,code:'STATUS_CHECK_RUNNING'});
   if(device.status==='maintenance')return{status:'maintenance',message:device.maintenanceReason||'Maintenance mode'};
@@ -20,6 +21,11 @@ class DeviceStatusService{
   }finally{this.running.delete(device.id);}
   await this.prisma.managedDeviceStatusHistory.create({data:{deviceId:device.id,status:result.status,message:result.message,latencyMs:result.latencyMs}});
   if(auditEvent)await audit(this.prisma,{ispId:device.ispId,deviceId:device.id,userId,action:'DEVICE_STATUS_REFRESH',success:result.status==='online',sourceIp,response:result,failureReason:result.status==='online'?null:result.message});
+  let health=null;
+  if(result.status==='online'&&await this.alarms.hasMetricRules(device.ispId)){
+   try{health=await createAdapter(device,this.connections).read('health',{ispId:device.ispId,userId});}catch(error){console.error('[DEVICE ALARM HEALTH]',device.id,error.message);}
+  }
+  await this.alarms.evaluate(device,{connection:{status:result.status},health}).catch(error=>console.error('[DEVICE ALARM]',device.id,error.message));
   return result;
  }
  async poll(){const now=new Date(),devices=await this.prisma.managedDevice.findMany({where:{isDeleted:false,enabled:true,pollingEnabled:true,status:{not:'maintenance'}}}),due=devices.filter(device=>{if(!device.lastCheckedAt)return true;const failures=Math.min(6,Math.max(0,Number(device.consecutiveFailureCount||0))),backoff=Math.min(3600,Math.max(10,Number(device.pollingInterval||300))*2**failures);return now-new Date(device.lastCheckedAt)>=backoff*1000;}),limit=Number(process.env.DEVICE_POLL_CONCURRENCY||5);for(let index=0;index<due.length;index+=limit)await Promise.allSettled(due.slice(index,index+limit).map(device=>this.refresh(device,{auditEvent:false})));const retentionDays=Number(process.env.DEVICE_STATUS_RETENTION_DAYS||30),cutoff=new Date(Date.now()-retentionDays*86400000);await this.prisma.managedDeviceStatusHistory.deleteMany({where:{checkedAt:{lt:cutoff}}});}

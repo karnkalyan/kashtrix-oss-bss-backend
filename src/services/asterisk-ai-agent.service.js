@@ -67,6 +67,25 @@ class AsteriskAiAgentService {
   async syncDefaultAgents() {
     const defaults = [
       {
+        extension: "5000",
+        name: "Kisan Net ISP Support AI Agent",
+        description: "Existing Kisan Net ISP Support AI Agent connecting via AudioSocket",
+        provider: "gemini_live",
+        model: "gemini-3.1-flash-live-preview",
+        voice: "Kore",
+        prompt: "You are the Kisan Net ISP Support AI Agent. Assist subscribers with support in Nepali.",
+        audioSocketHost: "127.0.0.1",
+        audioSocketPort: 9030,
+        serviceName: "kisannet-voice-agent",
+        systemdServiceName: "kisannet-voice-agent",
+        runtimePath: "/opt/gemini-voice-agent/kisannet_agent.py",
+        promptFilePath: "/opt/gemini-voice-agent/kisannet_prompt.txt",
+        enabled: true,
+        dialplanContext: "internal",
+        managedByProvisioning: true,
+        dialplanStatus: "deployed"
+      },
+      {
         extension: "800",
         name: "General Gemini Agent",
         description: "General-purpose Gemini Live voice assistant",
@@ -119,7 +138,7 @@ class AsteriskAiAgentService {
         serviceName: item.serviceName,
         enabled: item.enabled,
         runtimeStatus: 'stopped',
-        dialplanStatus: 'configured',
+        dialplanStatus: item.dialplanStatus || 'configured',
         extensionNumber: item.extension,
         agentName: item.name,
         systemPrompt: item.prompt,
@@ -192,10 +211,14 @@ class AsteriskAiAgentService {
     }
 
     const prov = await require('./asterisk-ai-agent-provisioning.service').getService(this.#ispId, this.#prisma);
+    let provRes = null;
     if (prov.isConfigured()) {
-      await prov.createAgentConfiguration({
+      provRes = await prov.createAgentConfiguration({
         extension: ext,
-        name: data.name,
+        name: data.name || data.agentName,
+        agentName: data.name || data.agentName,
+        dialplanContext: data.context || data.dialplanContext || 'internal',
+        audioSocketHost: data.audioSocketHost || '127.0.0.1',
         audioSocketPort: data.audioSocketPort,
         enabled: data.enabled !== false
       });
@@ -205,7 +228,7 @@ class AsteriskAiAgentService {
       data: {
         ispId: this.#ispId,
         extension: ext,
-        name: data.name || 'AI Voice Agent',
+        name: data.name || data.agentName || 'AI Voice Agent',
         description: data.description,
         provider: data.provider || 'gemini_live',
         model: data.model || 'gemini-2.5-flash',
@@ -218,13 +241,13 @@ class AsteriskAiAgentService {
         serviceName: data.serviceName || `ai-agent-${ext}`,
         enabled: data.enabled !== false,
         runtimeStatus: 'stopped',
-        dialplanStatus: prov.isConfigured() ? 'configured' : 'unverified',
+        dialplanStatus: provRes?.verified ? 'deployed' : (prov.isConfigured() ? 'configured' : 'unverified'),
         extensionNumber: ext,
-        agentName: data.name || 'AI Voice Agent',
+        agentName: data.name || data.agentName || 'AI Voice Agent',
         systemPrompt: data.prompt || 'You are a helpful assistant.',
         runtimeType: 'python',
         systemdServiceName: data.serviceName || `ai-agent-${ext}`,
-        dialplanContext: 'internal',
+        dialplanContext: data.context || data.dialplanContext || 'internal',
         managedByProvisioning: true
       }
     });
@@ -247,6 +270,9 @@ class AsteriskAiAgentService {
       throw new Error('AI Agent not found');
     }
 
+    const previousExtension = agent.extension;
+    const newExtension = data.extension ? String(data.extension).trim() : agent.extension;
+
     let nextVersion = agent.promptVersion;
     if (data.prompt && data.prompt !== agent.prompt) {
       nextVersion += 1;
@@ -263,24 +289,26 @@ class AsteriskAiAgentService {
     const updated = await this.#prisma.asteriskAiAgent.update({
       where: { id },
       data: {
-        name: data.name,
-        description: data.description,
-        model: data.model,
-        voice: data.voice,
-        prompt: data.prompt,
+        extension: newExtension,
+        name: data.name || data.agentName || agent.name,
+        description: data.description !== undefined ? data.description : agent.description,
+        model: data.model || agent.model,
+        voice: data.voice || agent.voice,
+        prompt: data.prompt || agent.prompt,
         promptVersion: nextVersion,
-        enabled: data.enabled,
-        audioSocketPort: data.audioSocketPort ? parseInt(data.audioSocketPort, 10) : undefined,
-        audioSocketHost: data.audioSocketHost,
-        extensionNumber: agent.extension,
-        agentName: data.name || agent.name,
-        systemPrompt: data.prompt || agent.prompt
+        enabled: data.enabled !== undefined ? Boolean(data.enabled) : agent.enabled,
+        audioSocketPort: data.audioSocketPort ? parseInt(data.audioSocketPort, 10) : agent.audioSocketPort,
+        audioSocketHost: data.audioSocketHost || agent.audioSocketHost,
+        extensionNumber: newExtension,
+        agentName: data.name || data.agentName || agent.name,
+        systemPrompt: data.prompt || agent.prompt,
+        dialplanContext: data.context || data.dialplanContext || agent.dialplanContext || 'internal'
       }
     });
 
     const prov = await require('./asterisk-ai-agent-provisioning.service').getService(this.#ispId, this.#prisma);
     if (prov.isConfigured()) {
-      await prov.updateAgentConfiguration(updated);
+      await prov.updateAgentConfiguration(updated, previousExtension);
     }
 
     return updated;

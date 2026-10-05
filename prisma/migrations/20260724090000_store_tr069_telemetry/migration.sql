@@ -1,0 +1,3 @@
+ALTER TABLE `tr069_devices`
+    ADD COLUMN `rxPower` DOUBLE NULL,
+    ADD COLUMN `uptime` INTEGER NULL;

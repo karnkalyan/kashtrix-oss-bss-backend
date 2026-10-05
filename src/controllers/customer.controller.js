@@ -5754,6 +5754,21 @@ async function listNasDevices(req, res, next) {
     const result = await client.listNasDevices();
     return res.json(result);
   } catch (error) {
+    const isConfigError = error.message && (
+      error.message.includes('not configured or enabled') ||
+      error.message.includes('not configured') ||
+      error.message.includes('not found')
+    );
+    if (isConfigError) {
+      return res.json({
+        success: true,
+        connected: false,
+        isConfigured: false,
+        data: [],
+        total: 0,
+        message: error.message
+      });
+    }
     console.error('Error listing NAS devices:', error);
     return res.status(500).json({ success: false, error: error.message });
   }
@@ -5767,6 +5782,22 @@ async function listActiveSessions(req, res, next) {
     const result = await client.listActiveSessions(limit, offset);
     return res.json(result);
   } catch (error) {
+    const isConfigError = error.message && (
+      error.message.includes('not configured or enabled') ||
+      error.message.includes('not configured') ||
+      error.message.includes('not found')
+    );
+    if (isConfigError) {
+      return res.json({
+        success: true,
+        connected: false,
+        isConfigured: false,
+        data: [],
+        sessions: [],
+        total: 0,
+        message: error.message
+      });
+    }
     console.error('Error listing active sessions:', error);
     return res.status(500).json({ success: false, error: error.message });
   }
@@ -5779,6 +5810,21 @@ async function getSessionInfoForUser(req, res, next) {
     const result = await client.getSessionInfo(username);
     return res.json(result);
   } catch (error) {
+    const isConfigError = error.message && (
+      error.message.includes('not configured or enabled') ||
+      error.message.includes('not configured') ||
+      error.message.includes('not found')
+    );
+    if (isConfigError) {
+      return res.json({
+        success: true,
+        connected: false,
+        isConfigured: false,
+        data: null,
+        session: null,
+        message: error.message
+      });
+    }
     console.error(`Error getting session info for user ${username}:`, error);
     return res.status(500).json({ success: false, error: error.message });
   }
@@ -5791,6 +5837,19 @@ async function disconnectLatestSession(req, res, next) {
     const result = await client.disconnectUser(username);
     return res.json({ success: true, ...result });
   } catch (error) {
+    const isConfigError = error.message && (
+      error.message.includes('not configured or enabled') ||
+      error.message.includes('not configured') ||
+      error.message.includes('not found')
+    );
+    if (isConfigError) {
+      return res.status(400).json({
+        success: false,
+        isConfigured: false,
+        error: error.message,
+        message: 'Radius service is not configured or enabled'
+      });
+    }
     console.error(`Error disconnecting latest session for user ${username}:`, error);
     const message = error.message || 'Disconnect failed';
     const radiusData = error.responseData || null;
@@ -5813,6 +5872,19 @@ async function disconnectAllSessions(req, res, next) {
     const result = await client.disconnectAllSessions(username);
     return res.json({ success: true, ...result });
   } catch (error) {
+    const isConfigError = error.message && (
+      error.message.includes('not configured or enabled') ||
+      error.message.includes('not configured') ||
+      error.message.includes('not found')
+    );
+    if (isConfigError) {
+      return res.status(400).json({
+        success: false,
+        isConfigured: false,
+        error: error.message,
+        message: 'Radius service is not configured or enabled'
+      });
+    }
     console.error(`Error disconnecting all sessions for user ${username}:`, error);
     const message = error.message || 'Disconnect failed';
     const radiusData = error.responseData || null;
@@ -5827,7 +5899,6 @@ async function disconnectAllSessions(req, res, next) {
     });
   }
 }
-
 async function disconnectBranchSessions(req, res, next) {
   const branchId = Number(req.params.branchId);
   if (isNaN(branchId)) return res.status(400).json({ success: false, error: 'Invalid branch ID' });

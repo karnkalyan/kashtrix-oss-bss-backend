@@ -28,7 +28,7 @@ class AsteriskAmiClient extends EventEmitter {
 
     this.socket.connect(port, host, () => {
       console.log(`[AMI CLIENT] TCP Connected to ${host}:${port}`);
-      // Authenticate - NEVER log the password/secret in logs
+      // Authenticate
       this.sendAction({
         Action: 'Login',
         Username: this.config.amiUsername,
@@ -37,7 +37,7 @@ class AsteriskAmiClient extends EventEmitter {
         if (res.Response === 'Success' || res.Message === 'Authentication accepted') {
           console.log('[AMI CLIENT] Authentication successful');
           this.connected = true;
-          this.reconnectAttempts = 0; // reset reconnect multiplier
+          this.reconnectAttempts = 0;
           this.startPing();
           this.emit('connected');
         } else {
@@ -79,13 +79,28 @@ class AsteriskAmiClient extends EventEmitter {
   handlePacket(packet) {
     const lines = packet.split('\r\n');
     const response = {};
+    let commandOutput = [];
+    let isCommandFollows = false;
+
     for (const line of lines) {
+      if (line.startsWith('--END COMMAND--')) {
+        continue;
+      }
       const idx = line.indexOf(':');
-      if (idx !== -1) {
+      if (idx !== -1 && !isCommandFollows) {
         const key = line.slice(0, idx).trim();
         const val = line.slice(idx + 1).trim();
         response[key] = val;
+        if (key === 'Response' && val === 'Follows') {
+          isCommandFollows = true;
+        }
+      } else if (isCommandFollows) {
+        commandOutput.push(line);
       }
+    }
+
+    if (commandOutput.length > 0) {
+      response.Output = commandOutput.join('\n');
     }
 
     // Emit packet event
@@ -108,7 +123,7 @@ class AsteriskAmiClient extends EventEmitter {
 
   sendAction(action) {
     return new Promise((resolve, reject) => {
-      if (!this.socket || !this.connected && action.Action !== 'Login') {
+      if (!this.socket || (!this.connected && action.Action !== 'Login')) {
         return reject(new Error('Socket not connected'));
       }
       const actionId = `act-${this.actionIdCounter++}`;
@@ -131,6 +146,33 @@ class AsteriskAmiClient extends EventEmitter {
         }
       }, 5000);
     });
+  }
+
+  async executeCommand(command) {
+    const res = await this.sendAction({
+      Action: 'Command',
+      Command: command
+    });
+    return res.Output || res.Message || JSON.stringify(res);
+  }
+
+  async reloadDialplan() {
+    return this.executeCommand('dialplan reload');
+  }
+
+  async reloadPjsip() {
+    return this.executeCommand('pjsip reload');
+  }
+
+  async addDialplanExtension({ context, extension, priority, app, appData, replace = false }) {
+    const dataPart = appData !== undefined && appData !== null ? `(${appData})` : '';
+    const cmd = `dialplan add extension ${extension},${priority},${app}${dataPart} into ${context || 'internal'}${replace ? ' replace' : ''}`;
+    return this.executeCommand(cmd);
+  }
+
+  async removeDialplanExtension({ context, extension }) {
+    const cmd = `dialplan remove extension ${extension}@${context || 'internal'}`;
+    return this.executeCommand(cmd);
   }
 
   sendActionWithEvents(action, eventName, completeEventName) {
@@ -194,7 +236,6 @@ class AsteriskAmiClient extends EventEmitter {
       this.socket = null;
     }
     if (!this.reconnectTimer) {
-      // Bounded exponential backoff: 2s, 4s, 8s, 16s, max 30s
       const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts++), 30000);
       console.log(`[AMI CLIENT] Scheduling reconnect in ${delay / 1000}s (Attempt ${this.reconnectAttempts})`);
       this.reconnectTimer = setTimeout(() => {

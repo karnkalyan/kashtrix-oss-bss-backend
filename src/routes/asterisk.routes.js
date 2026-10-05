@@ -238,5 +238,24 @@ module.exports = (prisma) => {
   router.delete('/ivr/:id', checkPermission('asterisk_manage'), (req, res) =>
     controller.deleteIvr(req, res));
 
+  /* ========== DIALPLAN & AMI CONTROL ========== */
+  router.get('/dialplan', checkPermission('asterisk_read'), noCache, (req, res) =>
+    controller.getDialplan(req, res));
+
+  router.post('/dialplan/extension', checkPermission('asterisk_manage'), (req, res) =>
+    controller.addDialplanExtension(req, res));
+
+  router.delete('/dialplan/extension', checkPermission('asterisk_manage'), (req, res) =>
+    controller.removeDialplanExtension(req, res));
+
+  router.post('/dialplan/reload', checkPermission('asterisk_manage'), (req, res) =>
+    controller.reloadDialplan(req, res));
+
+  router.post('/pjsip/reload', checkPermission('asterisk_manage'), (req, res) =>
+    controller.reloadPjsip(req, res));
+
+  router.post('/ami/command', checkPermission('asterisk_manage'), (req, res) =>
+    controller.executeAmiCommand(req, res));
+
   return router;
 };

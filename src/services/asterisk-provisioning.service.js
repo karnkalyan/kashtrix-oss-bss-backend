@@ -1,6 +1,7 @@
 const path = require('path');
 const crypto = require('crypto');
 const { AsteriskProvisioningAdapter } = require('./asterisk-provisioning-adapter');
+const { getAmiClient } = require('./asterisk-ami-client');
 
 const fileLocks = new Map();
 
@@ -43,28 +44,37 @@ class AsteriskProvisioningService {
   #prisma = null;
   #ispId = null;
   #config = null;
+  #astConfig = null;
   #adapter = null;
 
-  constructor(ispId, prisma, config) {
+  constructor(ispId, prisma, config, astConfig = null) {
     this.#ispId = ispId;
     this.#prisma = prisma;
     this.#config = config;
+    this.#astConfig = astConfig;
     this.#adapter = AsteriskProvisioningAdapter.create(config, prisma);
+  }
+
+  #getAmi() {
+    return getAmiClient(this.#ispId, this.#astConfig || this.#config);
   }
 
   static async getService(ispId, prisma) {
     let config = await prisma.asteriskProvisioningConfig.findUnique({
       where: { ispId }
     });
+    const astConfig = await prisma.asteriskConfig.findUnique({
+      where: { ispId }
+    });
     if (!config) {
       config = {
         ispId,
-        enabled: false,
-        provisioningMode: 'disabled',
-        mode: 'disabled'
+        enabled: astConfig ? astConfig.enabled : false,
+        provisioningMode: (astConfig && astConfig.amiEnabled) ? 'ami' : 'disabled',
+        mode: (astConfig && astConfig.amiEnabled) ? 'ami' : 'disabled'
       };
     }
-    return new AsteriskProvisioningService(ispId, prisma, config);
+    return new AsteriskProvisioningService(ispId, prisma, config, astConfig);
   }
 
   getAdapter() {
@@ -72,7 +82,14 @@ class AsteriskProvisioningService {
   }
 
   isConfigured() {
-    return !!(this.#config && this.#config.enabled && ['local', 'ssh'].includes(this.#config.provisioningMode || this.#config.mode));
+    const provMode = this.#config?.provisioningMode || this.#config?.mode;
+    if (this.#config && (this.#config.enabled || this.#config.provisioningEnabled)) {
+      if (['local', 'ssh', 'ami', 'ari'].includes(provMode)) return true;
+    }
+    if (this.#astConfig && this.#astConfig.enabled && (this.#astConfig.amiEnabled || this.#astConfig.ariEnabled)) {
+      return true;
+    }
+    return false;
   }
 
   async getCapabilities() {
@@ -83,9 +100,12 @@ class AsteriskProvisioningService {
         features: []
       };
     }
+    const ami = this.#getAmi();
+    const amiActive = ami && ami.connected;
     return {
       configured: true,
-      mode: this.#config.provisioningMode || this.#config.mode,
+      mode: this.#config.provisioningMode || this.#config.mode || 'ami',
+      amiConnected: !!amiActive,
       features: [
         'create_extension',
         'update_extension',
@@ -94,6 +114,7 @@ class AsteriskProvisioningService {
         'disable_extension',
         'reload_pjsip',
         'reload_dialplan',
+        'dialplan_live_injection',
         'service_status',
         'service_start',
         'service_stop',
@@ -104,7 +125,7 @@ class AsteriskProvisioningService {
 
   #assertConfigured() {
     if (!this.isConfigured()) {
-      const err = new Error('Asterisk provisioning is not configured for this ISP');
+      const err = new Error('Asterisk service/provisioning is not configured for this ISP');
       err.code = 'PROVISIONING_NOT_CONFIGURED';
       throw err;
     }
@@ -157,39 +178,62 @@ class AsteriskProvisioningService {
       throw new Error(`Extension ${extNumber} already exists`);
     }
 
-    await this.#acquireLock();
-    try {
-      const pjsipPath = this.#getPjsipPath();
-      let content = '';
-      if (await this.#adapter.fileExists(pjsipPath)) {
-        content = await this.#adapter.readFile(pjsipPath);
-      }
-      const sections = parseIni(content);
-      sections[extNumber] = {
-        type: 'endpoint',
-        auth: `${extNumber}-auth`,
-        aors: `${extNumber}-aor`,
-        context,
-        disallow: 'all',
-        allow: codecs.join(','),
-        transport
-      };
-      sections[`${extNumber}-auth`] = {
-        type: 'auth',
-        auth_type: 'userpass',
-        username: extNumber,
-        password: secret
-      };
-      sections[`${extNumber}-aor`] = {
-        type: 'aor',
-        max_contacts: '1'
-      };
+    const provMode = this.#config.provisioningMode || this.#config.mode;
+    if (['local', 'ssh'].includes(provMode)) {
+      await this.#acquireLock();
+      try {
+        const pjsipPath = this.#getPjsipPath();
+        let content = '';
+        if (await this.#adapter.fileExists(pjsipPath)) {
+          content = await this.#adapter.readFile(pjsipPath);
+        }
+        const sections = parseIni(content);
+        sections[extNumber] = {
+          type: 'endpoint',
+          auth: `${extNumber}-auth`,
+          aors: `${extNumber}-aor`,
+          context,
+          disallow: 'all',
+          allow: codecs.join(','),
+          transport
+        };
+        sections[`${extNumber}-auth`] = {
+          type: 'auth',
+          auth_type: 'userpass',
+          username: extNumber,
+          password: secret
+        };
+        sections[`${extNumber}-aor`] = {
+          type: 'aor',
+          max_contacts: '1'
+        };
 
-      await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
-      await this.reloadPjsip();
-    } finally {
-      this.#releaseLock();
+        await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
+      } catch (err) {
+        console.warn('[ASTERISK FILE PROVISIONING WARNING]:', err.message);
+      } finally {
+        this.#releaseLock();
+      }
     }
+
+    // AMI Live Dialplan & Reload
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.addDialplanExtension({
+          context,
+          extension: extNumber,
+          priority: 1,
+          app: 'Dial',
+          appData: `PJSIP/${extNumber},30`,
+          replace: true
+        });
+      } catch (amiErr) {
+        console.warn('[AMI addDialplanExtension warning]:', amiErr.message);
+      }
+    }
+    await this.reloadPjsip();
+    await this.reloadDialplan();
 
     const dbExt = await this.#prisma.asteriskExtension.create({
       data: {
@@ -268,22 +312,38 @@ class AsteriskProvisioningService {
       throw new Error('Invalid extension format.');
     }
 
-    await this.#acquireLock();
-    try {
-      const pjsipPath = this.#getPjsipPath();
-      let content = '';
-      if (await this.#adapter.fileExists(pjsipPath)) {
-        content = await this.#adapter.readFile(pjsipPath);
+    const provMode = this.#config.provisioningMode || this.#config.mode;
+    if (['local', 'ssh'].includes(provMode)) {
+      await this.#acquireLock();
+      try {
+        const pjsipPath = this.#getPjsipPath();
+        let content = '';
+        if (await this.#adapter.fileExists(pjsipPath)) {
+          content = await this.#adapter.readFile(pjsipPath);
+        }
+        const sections = parseIni(content);
+        delete sections[extNumber];
+        delete sections[`${extNumber}-auth`];
+        delete sections[`${extNumber}-aor`];
+        await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
+      } catch (err) {
+        console.warn('[ASTERISK FILE DELETE WARNING]:', err.message);
+      } finally {
+        this.#releaseLock();
       }
-      const sections = parseIni(content);
-      delete sections[extNumber];
-      delete sections[`${extNumber}-auth`];
-      delete sections[`${extNumber}-aor`];
-      await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
-      await this.reloadPjsip();
-    } finally {
-      this.#releaseLock();
     }
+
+    // AMI Live Dialplan extension removal & reload
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.removeDialplanExtension({ context: 'internal', extension: extNumber });
+      } catch (amiErr) {
+        console.warn('[AMI removeDialplanExtension warning]:', amiErr.message);
+      }
+    }
+    await this.reloadPjsip();
+    await this.reloadDialplan();
 
     await this.#prisma.asteriskExtension.update({
       where: {
@@ -303,22 +363,42 @@ class AsteriskProvisioningService {
 
   async enableExtension(extNumber) {
     this.#assertConfigured();
-    await this.#acquireLock();
-    try {
-      const pjsipPath = this.#getPjsipPath();
-      let content = '';
-      if (await this.#adapter.fileExists(pjsipPath)) {
-        content = await this.#adapter.readFile(pjsipPath);
+    const provMode = this.#config.provisioningMode || this.#config.mode;
+    if (['local', 'ssh'].includes(provMode)) {
+      await this.#acquireLock();
+      try {
+        const pjsipPath = this.#getPjsipPath();
+        let content = '';
+        if (await this.#adapter.fileExists(pjsipPath)) {
+          content = await this.#adapter.readFile(pjsipPath);
+        }
+        const sections = parseIni(content);
+        if (sections[extNumber]) {
+          sections[extNumber].context = 'internal';
+        }
+        await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
+      } catch (err) {
+        console.warn('[ASTERISK FILE ENABLE WARNING]:', err.message);
+      } finally {
+        this.#releaseLock();
       }
-      const sections = parseIni(content);
-      if (sections[extNumber]) {
-        sections[extNumber].context = 'internal';
-      }
-      await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
-      await this.reloadPjsip();
-    } finally {
-      this.#releaseLock();
     }
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.addDialplanExtension({
+          context: 'internal',
+          extension: extNumber,
+          priority: 1,
+          app: 'Dial',
+          appData: `PJSIP/${extNumber},30`,
+          replace: true
+        });
+      } catch (e) {}
+    }
+    await this.reloadPjsip();
+    await this.reloadDialplan();
+
     await this.#prisma.asteriskExtension.update({
       where: {
         ispId_pbxExtensionId: {
@@ -333,22 +413,35 @@ class AsteriskProvisioningService {
 
   async disableExtension(extNumber) {
     this.#assertConfigured();
-    await this.#acquireLock();
-    try {
-      const pjsipPath = this.#getPjsipPath();
-      let content = '';
-      if (await this.#adapter.fileExists(pjsipPath)) {
-        content = await this.#adapter.readFile(pjsipPath);
+    const provMode = this.#config.provisioningMode || this.#config.mode;
+    if (['local', 'ssh'].includes(provMode)) {
+      await this.#acquireLock();
+      try {
+        const pjsipPath = this.#getPjsipPath();
+        let content = '';
+        if (await this.#adapter.fileExists(pjsipPath)) {
+          content = await this.#adapter.readFile(pjsipPath);
+        }
+        const sections = parseIni(content);
+        if (sections[extNumber]) {
+          sections[extNumber].context = 'blackhole';
+        }
+        await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
+      } catch (err) {
+        console.warn('[ASTERISK FILE DISABLE WARNING]:', err.message);
+      } finally {
+        this.#releaseLock();
       }
-      const sections = parseIni(content);
-      if (sections[extNumber]) {
-        sections[extNumber].context = 'blackhole';
-      }
-      await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
-      await this.reloadPjsip();
-    } finally {
-      this.#releaseLock();
     }
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.removeDialplanExtension({ context: 'internal', extension: extNumber });
+      } catch (e) {}
+    }
+    await this.reloadPjsip();
+    await this.reloadDialplan();
+
     await this.#prisma.asteriskExtension.update({
       where: {
         ispId_pbxExtensionId: {
@@ -364,40 +457,91 @@ class AsteriskProvisioningService {
   async regenerateSecret(extNumber) {
     this.#assertConfigured();
     const newSecret = crypto.randomBytes(16).toString('hex');
-    await this.#acquireLock();
-    try {
-      const pjsipPath = this.#getPjsipPath();
-      let content = '';
-      if (await this.#adapter.fileExists(pjsipPath)) {
-        content = await this.#adapter.readFile(pjsipPath);
+    const provMode = this.#config.provisioningMode || this.#config.mode;
+    if (['local', 'ssh'].includes(provMode)) {
+      await this.#acquireLock();
+      try {
+        const pjsipPath = this.#getPjsipPath();
+        let content = '';
+        if (await this.#adapter.fileExists(pjsipPath)) {
+          content = await this.#adapter.readFile(pjsipPath);
+        }
+        const sections = parseIni(content);
+        if (sections[`${extNumber}-auth`]) {
+          sections[`${extNumber}-auth`].password = newSecret;
+        }
+        await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
+      } catch (err) {
+        console.warn('[ASTERISK FILE REGENERATE WARNING]:', err.message);
+      } finally {
+        this.#releaseLock();
       }
-      const sections = parseIni(content);
-      if (sections[`${extNumber}-auth`]) {
-        sections[`${extNumber}-auth`].password = newSecret;
-      }
-      await this.#adapter.writeManagedFile(pjsipPath, writeIni(sections));
-      await this.reloadPjsip();
-    } finally {
-      this.#releaseLock();
     }
+    await this.reloadPjsip();
     return { success: true, generatedSecret: newSecret };
   }
 
-  // System actions
+  // System actions via AMI first, then CLI fallback
   async reloadPjsip() {
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.reloadPjsip();
+        return { success: true, method: 'AMI' };
+      } catch (err) {
+        console.warn('[AMI reloadPjsip warning]:', err.message);
+      }
+    }
     try {
       await this.#adapter.runAsteriskCli(['pjsip', 'reload']);
+      return { success: true, method: 'CLI' };
     } catch (err) {
       console.warn('[ASTERISK reloadPjsip warning]:', err.message);
+      return { success: false, error: err.message };
     }
   }
 
   async reloadDialplan() {
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      try {
+        await ami.reloadDialplan();
+        return { success: true, method: 'AMI' };
+      } catch (err) {
+        console.warn('[AMI reloadDialplan warning]:', err.message);
+      }
+    }
     try {
       await this.#adapter.runAsteriskCli(['dialplan', 'reload']);
+      return { success: true, method: 'CLI' };
     } catch (err) {
       console.warn('[ASTERISK reloadDialplan warning]:', err.message);
+      return { success: false, error: err.message };
     }
+  }
+
+  async addDialplanExtension({ context = 'internal', extension, priority = 1, app = 'Dial', appData = '', replace = true }) {
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      return ami.addDialplanExtension({ context, extension, priority, app, appData, replace });
+    }
+    throw new Error('AMI is not connected. Live dialplan manipulation requires active AMI connection.');
+  }
+
+  async removeDialplanExtension({ context = 'internal', extension }) {
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      return ami.removeDialplanExtension({ context, extension });
+    }
+    throw new Error('AMI is not connected. Live dialplan manipulation requires active AMI connection.');
+  }
+
+  async executeAmiCommand(command) {
+    const ami = this.#getAmi();
+    if (ami && ami.connected) {
+      return ami.executeCommand(command);
+    }
+    throw new Error('AMI is not connected.');
   }
 
   async validateConfig() {

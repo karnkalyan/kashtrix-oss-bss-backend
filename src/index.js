@@ -62,6 +62,8 @@ const mailRouter = require('./routes/mail.routes');
 const templateRouter = require('./routes/template.routes');
 const taskRouter = require('./routes/task.routes');
 const externalPaymentRouter = require('./routes/externalPayment.routes');
+const globalPaymentRouter = require('./routes/globalPayment.routes');
+const twilioRouter = require('./routes/twilio.routes');
 const mcpRouter = require('./routes/mcp.routes');
 const importRouter = require('./routes/import.routes');
 const systemLogRouter = require('./routes/systemLog.routes');
@@ -263,6 +265,10 @@ app.use('/api/network-operations', require('./routes/network-operations.routes')
 app.use('/api/mcp', mcpRouter(prisma));
 app.use('/api/externalpayment', externalPaymentRouter(prisma));
 app.use('/api/external-payment', externalPaymentRouter(prisma));
+app.use('/payment', globalPaymentRouter(prisma));
+app.use('/api/payment', globalPaymentRouter(prisma));
+app.use('/twilio', twilioRouter(prisma));
+app.use('/api/twilio', twilioRouter(prisma));
 app.use('/api/import', importRouter(prisma));
 app.use('/api/system-logs', systemLogRouter(prisma));
 

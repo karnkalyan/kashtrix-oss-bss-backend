@@ -1232,6 +1232,91 @@ class AsteriskController {
       res.status(400).json(this.#handleServiceError(error, 'delete_recording'));
     }
   }
+
+  // ==================== DIALPLAN & AMI DIRECT CONTROL ====================
+  async getDialplan(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const context = req.query.context || '';
+      const output = await prov.executeAmiCommand(context ? `dialplan show ${context}` : 'dialplan show');
+      res.json({ success: true, data: output });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'get_dialplan'));
+    }
+  }
+
+  async addDialplanExtension(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const { context = 'internal', extension, priority = 1, app = 'Dial', appData = '', replace = true } = req.body;
+      if (!extension) {
+        return res.status(400).json({ success: false, error: 'extension is required' });
+      }
+      const output = await prov.addDialplanExtension({ context, extension, priority, app, appData, replace });
+      await logAudit(this.prisma, req.user?.id, 'ADD_DIALPLAN_EXTENSION', { context, extension, app }, req);
+      res.json({ success: true, message: 'Dialplan extension added successfully', data: output });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'add_dialplan_extension'));
+    }
+  }
+
+  async removeDialplanExtension(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const { context = 'internal', extension } = req.body;
+      if (!extension) {
+        return res.status(400).json({ success: false, error: 'extension is required' });
+      }
+      const output = await prov.removeDialplanExtension({ context, extension });
+      await logAudit(this.prisma, req.user?.id, 'REMOVE_DIALPLAN_EXTENSION', { context, extension }, req);
+      res.json({ success: true, message: 'Dialplan extension removed successfully', data: output });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'remove_dialplan_extension'));
+    }
+  }
+
+  async reloadDialplan(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const result = await prov.reloadDialplan();
+      await logAudit(this.prisma, req.user?.id, 'RELOAD_DIALPLAN', {}, req);
+      res.json({ success: true, message: 'Dialplan reloaded successfully', data: result });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'reload_dialplan'));
+    }
+  }
+
+  async reloadPjsip(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const result = await prov.reloadPjsip();
+      await logAudit(this.prisma, req.user?.id, 'RELOAD_PJSIP', {}, req);
+      res.json({ success: true, message: 'PJSIP reloaded successfully', data: result });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'reload_pjsip'));
+    }
+  }
+
+  async executeAmiCommand(req, res) {
+    try {
+      const ispId = req.ispId;
+      const prov = await AsteriskProvisioningService.getService(ispId, this.prisma);
+      const { command } = req.body;
+      if (!command) {
+        return res.status(400).json({ success: false, error: 'command is required' });
+      }
+      const output = await prov.executeAmiCommand(command);
+      await logAudit(this.prisma, req.user?.id, 'EXECUTE_AMI_COMMAND', { command }, req);
+      res.json({ success: true, output });
+    } catch (error) {
+      res.status(400).json(this.#handleServiceError(error, 'execute_ami_command'));
+    }
+  }
 }
 
 module.exports = AsteriskController;

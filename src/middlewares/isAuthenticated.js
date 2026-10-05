@@ -7,8 +7,35 @@ if (!process.env.ACCESS_SECRET) {
 
 const ACCESS_SECRET = process.env.ACCESS_SECRET;
 
+// In-memory cache for high-frequency user/role auth resolution
+const userAuthCache = new Map();
+const USER_CACHE_TTL_MS = 20000; // 20 seconds TTL
+
+function getCachedUser(userId) {
+  const cached = userAuthCache.get(userId);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.user;
+  }
+  return null;
+}
+
+function setCachedUser(userId, user) {
+  if (userAuthCache.size > 2000) {
+    userAuthCache.clear();
+  }
+  userAuthCache.set(userId, { user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+}
+
+function invalidateUserAuthCache(userId) {
+  if (userId) {
+    userAuthCache.delete(userId);
+  } else {
+    userAuthCache.clear();
+  }
+}
+
 module.exports = (prisma) => {
-  return async (req, res, next) => {
+  const authMiddleware = async (req, res, next) => {
     req.prisma = prisma;
 
     // 1) Get token (cookie > header)
@@ -27,39 +54,45 @@ module.exports = (prisma) => {
     try {
       payload = jwt.verify(token, ACCESS_SECRET);
     } catch (err) {
-      console.error('JWT verification failed:', err.message);
       return res.status(403).json({ error: 'Unauthorized: Invalid token' });
     }
 
-    // 3) Load user + role + permissions (MINIMAL & CORRECT)
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: {
-        id: true,
-        email: true,
-        ispId: true,
-        branchId: true,
-        resellerId: true,
-        isDeleted: true,
-        yeastarExt: true,
-        customerId: true,
-        branch: {
-          select: { id: true, parentId: true }
-        },
-        userBranches: {
-          select: { branchId: true }
-        },
-        role: {
-          select: {
-            name: true,
-            isActive: true,
-            permissions: {
-              select: { name: true }
+    // 3) Load user + role + permissions (Cached with fast fallback)
+    let user = getCachedUser(payload.userId);
+    if (!user) {
+      user = await prisma.user.findUnique({
+        where: { id: payload.userId },
+        select: {
+          id: true,
+          email: true,
+          ispId: true,
+          branchId: true,
+          resellerId: true,
+          isDeleted: true,
+          yeastarExt: true,
+          customerId: true,
+          branch: {
+            select: { id: true, parentId: true }
+          },
+          userBranches: {
+            select: { branchId: true }
+          },
+          role: {
+            select: {
+              name: true,
+              isActive: true,
+              permissions: {
+                select: { name: true }
+              }
             }
           }
         }
+      });
+
+      if (user && !user.isDeleted && user.role?.isActive !== false) {
+        setCachedUser(payload.userId, user);
       }
-    });
+    }
 
     if (!user || user.isDeleted) {
       return res.status(401).json({ error: 'Unauthorized: User not found or deleted' });
@@ -76,7 +109,6 @@ module.exports = (prisma) => {
     // Admin bypasses branch checks; others must have explicit access
     const roleName = user.role?.name?.toLowerCase() || '';
     const isGlobal = roleName === 'administrator' || roleName === 'global manager' || roleName.startsWith('global ');
-    // HQ users (branch with no parent) also see all data
     const isHQ = user.branch && user.branch.parentId === null;
     const isAllAccess = isGlobal || isHQ;
     let hasAccess = isAllAccess || 
@@ -101,7 +133,6 @@ module.exports = (prisma) => {
     }
 
     if (selectedBranchId && !hasAccess) {
-      console.error(`[Auth] Access Denied: User ${user.email} (Role: ${user.role?.name}, Primary: ${user.branchId}) tried to access branch ${selectedBranchId}. userBranches:`, user.userBranches);
       return res.status(403).json({ error: 'Access denied: You do not have permission for this branch' });
     }
 
@@ -112,8 +143,8 @@ module.exports = (prisma) => {
       role: user.role?.name ?? null,
       permissions: user.role?.permissions.map(p => p.name) ?? [],
       ispId: user.ispId,
-      branchId: user.branchId, // User's primary branch
-      selectedBranchId: selectedBranchId, // Current context branch
+      branchId: user.branchId,
+      selectedBranchId: selectedBranchId,
       extId: user.yeastarExt,
       customerId: user.customerId,
       resellerId: user.resellerId
@@ -121,9 +152,14 @@ module.exports = (prisma) => {
 
     req.ispId = user.ispId;
     req.selectedBranchId = selectedBranchId;
-    req.branchId = isAllAccess ? null : selectedBranchId; // Global/HQ roles see all, others are restricted
+    req.branchId = isAllAccess ? null : selectedBranchId;
     req.extId = user.yeastarExt;
 
     next();
   };
+
+  authMiddleware.invalidateUserAuthCache = invalidateUserAuthCache;
+  return authMiddleware;
 };
+
+module.exports.invalidateUserAuthCache = invalidateUserAuthCache;

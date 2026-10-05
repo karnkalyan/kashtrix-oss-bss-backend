@@ -13,7 +13,7 @@ services:
       - "127.0.0.1:3200:3200"
 
     environment:
-      KTE_JWT_SECRET: ${KTE_JWT_SECRET:?KTE_JWT_SECRET is required}
+      KTE_JWT_SECRET: ${KTE_JWT_SECRET:-KashTrans@12$#Secret!@SecureJWTKey2026_Kashtrix}
       KTX_LICENSE_SERVER_URL: ${KTX_LICENSE_SERVER_URL:-https://license.simulcast.com.np}
       KTX_LICENSE_SERVER_HOST: ${KTX_LICENSE_SERVER_HOST:-license.simulcast.com.np}
       KTX_LICENSE_SERVER_PORT: ${KTX_LICENSE_SERVER_PORT:-7443}

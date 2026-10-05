@@ -11,7 +11,7 @@ const WebSocketManager = require('./lib/websocket.js'); // Your WebSocketManager
 const YeastarService = require('./services/yeaster.service');
 const whatsappService = require('./services/whatsapp.service');
 const databaseBackupService = require('./services/database-backup.service');
-const { licenseGuard } = require('./services/license.service');
+const { licenseGuard, secureLicense } = require('./services/license.service');
 const { errorHandler } = require('./middlewares/errorHandler');
 const requestLogger = require('./middlewares/requestLogger');
 
@@ -61,6 +61,9 @@ const messageRouter = require('./routes/message.routes');
 const mailRouter = require('./routes/mail.routes');
 const templateRouter = require('./routes/template.routes');
 const taskRouter = require('./routes/task.routes');
+const externalPaymentRouter = require('./routes/externalPayment.routes');
+const importRouter = require('./routes/import.routes');
+const systemLogRouter = require('./routes/systemLog.routes');
 const taskLogger = require('./middlewares/taskLogger');
 const calendarDateSupport = require('./middlewares/calendarDateSupport');
 const createRateLimit = require('./middlewares/rateLimit');
@@ -137,6 +140,8 @@ app.use('/license', licenseRouter(prisma));
 app.use('/api/license', licenseRouter(prisma));
 app.use(licenseGuard(prisma));
 
+require('./utils/initExternalPaymentDb')(prisma).catch(err => console.warn('[initExternalPaymentDb] Warning:', err.message));
+
 app.use('/users', usersRouter(prisma));
 app.use('/auth', authRouter(prisma));
 app.use('/tshul', tshulRouter);
@@ -192,6 +197,10 @@ app.use('/ai-agent-approvals', aiAgentApprovalRouter(prisma));
 app.use('/themes', themeRouter(prisma));
 app.use('/devices', managedDeviceRouter(prisma));
 app.use('/network-operations', require('./routes/network-operations.routes')(prisma));
+app.use('/externalpayment', externalPaymentRouter(prisma));
+app.use('/external-payment', externalPaymentRouter(prisma));
+app.use('/import', importRouter(prisma));
+app.use('/system-logs', systemLogRouter(prisma));
 
 app.use('/api/users', usersRouter(prisma));
 app.use('/api/auth', authRouter(prisma));
@@ -249,6 +258,10 @@ app.use('/api/ai-agent-approvals', aiAgentApprovalRouter(prisma));
 app.use('/api/themes', themeRouter(prisma));
 app.use('/api/devices', managedDeviceRouter(prisma));
 app.use('/api/network-operations', require('./routes/network-operations.routes')(prisma));
+app.use('/api/externalpayment', externalPaymentRouter(prisma));
+app.use('/api/external-payment', externalPaymentRouter(prisma));
+app.use('/api/import', importRouter(prisma));
+app.use('/api/system-logs', systemLogRouter(prisma));
 
 app.use('/resellers', require('./routes/reseller.routes')(prisma));
 app.use('/api/resellers', require('./routes/reseller.routes')(prisma));
@@ -319,6 +332,10 @@ server.listen(PORT, '0.0.0.0', () => {
     // Resume approved and non-sensitive AI work even after a server restart.
     require('./controllers/ai-agent.controller').startTaskWorker(prisma);
 
+    secureLicense.start().catch((error) => {
+        console.error('[SECURE LICENSE] Failed to start runtime:', error.message);
+    });
+
     const { runCustomerLifecycle } = require('./services/customerLifecycle.service');
     runCustomerLifecycle(prisma).catch(error => console.error('[CUSTOMER LIFECYCLE]', error.message));
     const lifecycleTimer = setInterval(() => runCustomerLifecycle(prisma).catch(error => console.error('[CUSTOMER LIFECYCLE]', error.message)), 6 * 60 * 60 * 1000);
@@ -329,6 +346,7 @@ server.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
     console.log('Shutting down server...');
+    secureLicense.close();
     managedDeviceStatus.stop();
     databaseBackupService.stopScheduler();
     if (webSocketManager.shutdown) {
@@ -343,6 +361,7 @@ process.on('beforeExit', async () => {
 
 process.on('SIGINT', async () => {
     console.log('Shutting down server...');
+    secureLicense.close();
     managedDeviceStatus.stop();
     databaseBackupService.stopScheduler();
     if (webSocketManager.shutdown) webSocketManager.shutdown();

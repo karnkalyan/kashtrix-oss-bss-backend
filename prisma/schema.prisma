@@ -58,6 +58,7 @@ model Branch {
   existingISPs             ExistingISP[]
   connectionUsers          ConnectionUser[]
   customerDocuments        CustomerDocument[]
+  externalPayments         ExternalPayment[]
   esewaPayments            ESewaTokenPayment[]
   terminalSessions         TerminalSession[]
   terminalCommands         TerminalCommand[]
@@ -222,6 +223,8 @@ model ISP {
   managedDevices                ManagedDevice[]
   resellers                     Reseller[]
   apiTokens                     ApiToken[]
+  externalPaymentConfig         ExternalPaymentConfiguration?
+  externalPayments              ExternalPayment[]
 }
 
 // ==================== USER MODEL ====================
@@ -637,6 +640,7 @@ model Customer {
   tickets               Ticket[]
   tasks                 Task[]
   branchRequests        BranchRequest[]
+  externalPayments      ExternalPayment[]
 
   resellerId Int?
   reseller   Reseller? @relation("ResellerCustomers", fields: [resellerId], references: [id], map: "customer_reseller_fkey")
@@ -4038,3 +4042,89 @@ model ApiToken {
   @@index([tokenHash])
   @@map("api_tokens")
 }
+
+// ==================== SYSTEM LOGS ====================
+model SystemLog {
+  id         Int      @id @default(autoincrement())
+  ispId      Int?
+  userId     Int?
+  level      String   @db.VarChar(16)
+  operation  String   @db.VarChar(120)
+  message    String   @db.Text
+  method     String?  @db.VarChar(10)
+  path       String?  @db.VarChar(500)
+  statusCode Int?
+  ip         String?  @db.VarChar(191)
+  userAgent  String?  @db.VarChar(500)
+  durationMs Int?
+  details    Json?
+  timestamp  DateTime @default(now())
+
+  @@index([ispId, timestamp])
+  @@index([level, timestamp])
+  @@index([operation, timestamp])
+  @@map("system_logs")
+}
+
+// ==================== EXTERNAL PAYMENT MODELS ====================
+model ExternalPayment {
+  id               String    @id @default(cuid())
+  ispId            Int
+  customerId       Int?
+  customerUniqueId String?   @db.VarChar(100)
+  username         String?   @db.VarChar(191)
+  requestId        String    @db.VarChar(191)
+  amount           Float
+  paymentMode      String    @default("EXTERNAL") @db.VarChar(100)
+  status           String    @default("COMPLETED") @db.VarChar(50)
+  transactionCode  String?   @db.VarChar(191)
+  packageDuration  String?   @db.VarChar(100)
+  packageDetails   Json?
+  orderId          String?   @db.VarChar(191)
+  referenceCode    String?   @db.VarChar(191)
+  createdAt        DateTime  @default(now())
+  paidAt           DateTime?
+  branchId         Int?
+  branch           Branch?   @relation(fields: [branchId], references: [id], map: "ext_payment_branch_fkey")
+  customer         Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade, map: "ext_payment_customer_fkey")
+  isp              ISP       @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "ext_payment_isp_fkey")
+
+  @@index([requestId])
+  @@index([customerUniqueId])
+  @@index([transactionCode])
+  @@index([status])
+  @@map("external_payments")
+}
+
+model ExternalPaymentConfiguration {
+  ispId              Int                    @id @unique
+  username           String                 @db.VarChar(191)
+  passwordHash       String                 @db.VarChar(191)
+  apiKey             String?                @db.VarChar(191)
+  authMethod         String                 @default("BEARER") @db.VarChar(50)
+  defaultPaymentMode String                 @default("EXTERNAL") @db.VarChar(50)
+  isActive           Boolean                @default(true)
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  isp                ISP                    @relation(fields: [ispId], references: [id], onDelete: Cascade, map: "ext_pay_config_isp_fkey")
+  tokens             ExternalPaymentToken[]
+
+  @@map("external_payment_configurations")
+}
+
+model ExternalPaymentToken {
+  id        String                       @id @default(cuid())
+  token     String                       @db.Text
+  configId  Int
+  type      String                       @default("access") @db.VarChar(50)
+  expiresAt DateTime
+  isRevoked Boolean                      @default(false)
+  createdAt DateTime                     @default(now())
+  config    ExternalPaymentConfiguration @relation(fields: [configId], references: [ispId], onDelete: Cascade, map: "ext_pay_token_config_fkey")
+
+  @@index([configId])
+  @@index([expiresAt])
+  @@index([isRevoked])
+  @@map("external_payment_tokens")
+}
+

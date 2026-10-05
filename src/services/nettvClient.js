@@ -359,10 +359,18 @@ class NetTVClient {
         return result;
     }
 
+    async assignSubscriberGroup(subscriberId, subscriberGroupId = 6, resellerId = null) {
+        const rId = resellerId || this.#config.resellerId;
+        if (!rId) throw new Error('NetTV reseller/namespace ID is not configured');
+        const apiOrigin = new URL(this.#config.baseUrl).origin;
+        const endpoint = `${apiOrigin}/reseller/subscriber/v2/namespace/${encodeURIComponent(rId)}/subscribers/${encodeURIComponent(subscriberId)}/subscriber-groups`;
+        return this.#apiRequest('post', endpoint, {
+            subscriber_groups: [{ subscriber_group_id: Number(subscriberGroupId) }]
+        });
+    }
+
     async addSubscriberGroup(subscriberId, groupId = 6, resellerId = null) {
-        const rId = resellerId || this.#config.resellerId || 2946;
-        const endpoint = `/reseller/subscriber/v2/namespace/${rId}/subscribers/${subscriberId}/subscriber-groups`;
-        return this.#apiRequest('post', endpoint, { subscriber_group_id: Number(groupId) });
+        return this.assignSubscriberGroup(subscriberId, groupId, resellerId);
     }
 
 

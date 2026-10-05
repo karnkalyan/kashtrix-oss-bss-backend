@@ -36,6 +36,23 @@ async function resolveOneTimeCharges(prisma, ispId, requestedCharges) {
   return [...new Set(finalIds)];
 }
 
+async function generateUniqueReferenceId(prisma, baseRefId, currentId = null) {
+  let candidate = baseRefId;
+  let attempt = 0;
+  while (true) {
+    const existing = await prisma.PackagePrice.findFirst({
+      where: {
+        referenceId: candidate,
+        ...(currentId ? { id: { not: Number(currentId) } } : {})
+      },
+      select: { id: true }
+    });
+    if (!existing) return candidate;
+    attempt++;
+    candidate = `${baseRefId}-${attempt}`;
+  }
+}
+
 async function createPackagePrice(req, res, next) {
   try {
     const {
@@ -69,11 +86,7 @@ async function createPackagePrice(req, res, next) {
     const cleanPlanCode = plan.planCode.replace(/[\s-]/g, '');       // remove spaces & hyphens
     const cleanDuration = packageDuration.replace(/[\s-]/g, '');     // remove spaces & hyphens
     const baseRefId = `INT-${cleanPlanCode}${cleanDuration}`;
-    const referenceId = `${baseRefId}`;
-
-    // (optional) ensure uniqueness
-    const exists = await req.prisma.PackagePrice.findFirst({ where: { referenceId } });
-    if (exists) return res.status(400).json({ error: 'Reference ID collision, try again' });
+    const referenceId = await generateUniqueReferenceId(req.prisma, baseRefId);
 
     const addonPrices = {};
     const chargesToResolve = oneTimeCharges.length > 0 ? oneTimeCharges : oneTimeChargeIds;

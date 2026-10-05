@@ -12,8 +12,26 @@ services:
     ports:
       - "127.0.0.1:3200:3200"
 
+    environment:
+      KTE_JWT_SECRET: ${KTE_JWT_SECRET:?KTE_JWT_SECRET is required}
+      KTX_LICENSE_SERVER_URL: ${KTX_LICENSE_SERVER_URL:-https://license.simulcast.com.np}
+      KTX_LICENSE_SERVER_HOST: ${KTX_LICENSE_SERVER_HOST:-license.simulcast.com.np}
+      KTX_LICENSE_SERVER_PORT: ${KTX_LICENSE_SERVER_PORT:-7443}
+      KTX_LICENSE_SERVERNAME: ${KTX_LICENSE_SERVERNAME:-license.simulcast.com.np}
+      KTX_LICENSE_TENANT_ID: ${KTX_LICENSE_TENANT_ID:-fb86704e-69a7-46fb-8e6d-50b8aa9cec6b}
+      KTX_LICENSE_APPLICATION_ID: ${KTX_LICENSE_APPLICATION_ID:-729a2fba-624b-4e7c-abc7-c51861aad64b}
+      KTX_LICENSE_CA_PATH: /run/secrets/license-ca.pem
+      KTX_LICENSE_CLIENT_CERT_PATH: /run/secrets/license-client-cert.pem
+      KTX_LICENSE_CLIENT_KEY_PATH: /run/secrets/license-client-key.pem
+      KTX_LICENSE_PUBLIC_KEY_PATH: /run/secrets/license-ed25519-public.pem
+
     volumes:
       - ./uploads:/app/uploads
+      - ./certs/production/ca-cert.pem:/run/secrets/license-ca.pem:ro
+      - ./certs/production/client-cert.pem:/run/secrets/license-client-cert.pem:ro
+      - ./certs/production/client-key.pem:/run/secrets/license-client-key.pem:ro
+      - ./certs/production/license-ed25519-public.pem:/run/secrets/license-ed25519-public.pem:ro
+      - license-client-data:/app/data/secure-license
 
     env_file:
       - /etc/kashtrix/secrets/backend.env
@@ -23,6 +41,9 @@ services:
 
     networks:
       - app-network
+
+volumes:
+  license-client-data:
 
 networks:
   app-network:

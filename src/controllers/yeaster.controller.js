@@ -103,10 +103,27 @@ class YeastarController {
   async getSystemInfo(req, res) {
     try {
       const ispId = req.ispId;
+      const status = await YeastarService.getServiceStatus(ispId, this.prisma);
+      if (!status?.configured) {
+        return res.json({
+          success: true,
+          configured: false,
+          status: 'Not Configured',
+          message: 'Yeastar service not configured for ISP'
+        });
+      }
       const service = await YeastarService.create(ispId, this.prisma);
       const result = await service.getSystemInfo();
       res.json(result);
     } catch (error) {
+      if (error?.message && error.message.includes('not configured')) {
+        return res.json({
+          success: true,
+          configured: false,
+          status: 'Not Configured',
+          message: error.message
+        });
+      }
       res.status(500).json(this.#handleServiceError(error, 'get_system_info'));
     }
   }

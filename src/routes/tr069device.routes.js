@@ -13,7 +13,10 @@ const {
   refreshDeviceOptics,
   linkLead,
   unlinkLead,
-  deleteDevice
+  deleteDevice,
+  getOltPowerBySerial,
+  refreshOltPowerBySerial,
+  syncDeviceRadiusPassword
 } = require('../controllers/tr069device.controller');
 
 module.exports = (prisma) => {
@@ -41,6 +44,12 @@ module.exports = (prisma) => {
     syncDevice
   );
 
+  router.post(
+    '/:serialNumber/sync-radius-password',
+    checkPermission('services_manage'),
+    syncDeviceRadiusPassword
+  );
+
   // List all local devices
   router.get(
     '/',
@@ -58,6 +67,20 @@ module.exports = (prisma) => {
     '/:serialNumber/refresh-optics',
     checkPermission('services_manage'),
     refreshDeviceOptics
+  );
+
+  // Get OLT power data for a device by serial number
+  router.get(
+    '/:serial/olt-power',
+    checkPermission('services_read'),
+    getOltPowerBySerial
+  );
+
+  // Refresh live OLT power data for a device directly from OLT
+  router.post(
+    '/:serial/refresh-olt-power',
+    checkPermission('services_manage'),
+    refreshOltPowerBySerial
   );
 
   // Get device by serial number

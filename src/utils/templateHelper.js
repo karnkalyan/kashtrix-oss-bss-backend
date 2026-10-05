@@ -278,59 +278,47 @@ const DEFAULT_TEMPLATES = [
 ];
 
 async function ensureTemplateTable(db = prisma) {
-  await db.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS message_templates (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      ispId INT NOT NULL,
-      channel VARCHAR(16) NOT NULL,
-      eventKey VARCHAR(80) NOT NULL,
-      name VARCHAR(160) NOT NULL,
-      subject VARCHAR(255) NULL,
-      body LONGTEXT NOT NULL,
-      isActive BOOLEAN NOT NULL DEFAULT true,
-      isDefault BOOLEAN NOT NULL DEFAULT false,
-      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX message_templates_isp_channel_idx (ispId, channel),
-      INDEX message_templates_event_idx (ispId, channel, eventKey)
-    )
-  `);
+  // Table is managed by Prisma (MessageTemplate model)
 }
 
 async function seedDefaultTemplates(ispId, db = prisma) {
-  await ensureTemplateTable(db);
+  if (!db.messageTemplate) return;
+  const numericIspId = Number(ispId);
   for (const template of DEFAULT_TEMPLATES) {
-    const existing = await db.$queryRawUnsafe(
-      `SELECT id, name, subject, body FROM message_templates WHERE ispId = ? AND channel = ? AND eventKey = ? AND isDefault = true LIMIT 1`,
-      ispId,
-      template.channel,
-      template.eventKey
-    );
-    if (existing.length) {
-      const current = existing[0];
+    const existing = await db.messageTemplate.findFirst({
+      where: {
+        ispId: numericIspId,
+        channel: template.channel,
+        eventKey: template.eventKey,
+        isDefault: true
+      }
+    });
+    if (existing) {
       const nextSubject = template.subject || null;
-      if (current.name !== template.name || current.subject !== nextSubject || current.body !== template.body) {
-        await db.$executeRawUnsafe(
-          `UPDATE message_templates
-           SET name = ?, subject = ?, body = ?, isActive = true, updatedAt = NOW()
-           WHERE id = ?`,
-          template.name,
-          nextSubject,
-          template.body,
-          current.id
-        );
+      if (existing.name !== template.name || existing.subject !== nextSubject || existing.body !== template.body) {
+        await db.messageTemplate.update({
+          where: { id: existing.id },
+          data: {
+            name: template.name,
+            subject: nextSubject,
+            body: template.body,
+            isActive: true
+          }
+        });
       }
     } else {
-      await db.$executeRawUnsafe(
-        `INSERT INTO message_templates (ispId, channel, eventKey, name, subject, body, isActive, isDefault, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, true, true, NOW(), NOW())`,
-        ispId,
-        template.channel,
-        template.eventKey,
-        template.name,
-        template.subject || null,
-        template.body
-      );
+      await db.messageTemplate.create({
+        data: {
+          ispId: numericIspId,
+          channel: template.channel,
+          eventKey: template.eventKey,
+          name: template.name,
+          subject: template.subject || null,
+          body: template.body,
+          isActive: true,
+          isDefault: true
+        }
+      });
     }
   }
 }
@@ -402,16 +390,22 @@ async function renderTemplate(ispId, channel, eventKey, data = {}, fallback = {}
       };
     }
   }
-  const rows = await db.$queryRawUnsafe(
-    `SELECT subject, body FROM message_templates
-     WHERE ispId = ? AND channel = ? AND eventKey = ? AND isActive = true
-     ORDER BY isDefault ASC, updatedAt DESC
-     LIMIT 1`,
-    ispId,
-    normalizedChannel,
-    eventKey
-  );
-  const template = rows[0] || fallback;
+  let template = fallback;
+  if (db.messageTemplate) {
+    const row = await db.messageTemplate.findFirst({
+      where: {
+        ispId: Number(ispId),
+        channel: normalizedChannel,
+        eventKey,
+        isActive: true
+      },
+      orderBy: [
+        { isDefault: 'asc' },
+        { updatedAt: 'desc' }
+      ]
+    });
+    if (row) template = row;
+  }
   // Company fields loaded for the authenticated ISP are authoritative. Some
   // callers provide generic fallback values (for example "ISP"), which must
   // not replace the real tenant branding resolved above.

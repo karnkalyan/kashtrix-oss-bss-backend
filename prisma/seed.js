@@ -97,6 +97,13 @@ async function main() {
     { name: 'customer_update', menuName: 'customers' },
     { name: 'customer_delete', menuName: 'customers' },
 
+    // Ticket Management
+    { name: 'tickets_read', menuName: 'tickets' },
+    { name: 'tickets_create', menuName: 'tickets' },
+    { name: 'tickets_update', menuName: 'tickets' },
+    { name: 'tickets_delete', menuName: 'tickets' },
+    { name: 'tickets_read_self', menuName: 'tickets' },
+
 
     // Existing ISP Management
     { name: 'existingisp_read', menuName: 'existingisp' },
@@ -284,9 +291,9 @@ async function main() {
   const createdRoles = {};
   for (const roleData of rolesData) {
     // Map by the full permission name string
-    const rolePermissions = roleData.permissions.map(
-      (pData) => ({ id: createdPermissions[pData.name].id }) // Use pData.name to get the ID
-    );
+    const rolePermissions = roleData.permissions
+      .map((pData) => createdPermissions[pData.name]?.id ? { id: createdPermissions[pData.name].id } : null)
+      .filter(Boolean);
     const role = await prisma.role.create({
       data: {
         name: roleData.name,

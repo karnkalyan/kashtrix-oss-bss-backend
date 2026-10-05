@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { syncOrderToAccounting } = require('../services/accountingInvoice.service');
 const { logAudit } = require('../utils/auditLogger');
+const { atPlanBoundary, getDeductibleRenewalBase } = require('../utils/dateHelper');
 
 async function syncEsewaAccounting(prisma, ispId, orderId) {
   try {
@@ -41,28 +42,18 @@ function generateEsewaReferenceCode(orderId) {
 }
 
 function getRenewalBase(subscription, now = new Date()) {
-  if (!subscription) return now;
-  const planEnd = subscription?.planEnd ? new Date(subscription.planEnd) : now;
-  const graceDays = Math.max(0, Number(subscription?.graceDaysBalance || 0));
-  const adminDays = Math.max(0, Number(subscription?.adminExtensionDays || 0));
-  const deductibleDays = graceDays + adminDays;
-  const expiryBeforeExtension = new Date(planEnd);
-  expiryBeforeExtension.setDate(expiryBeforeExtension.getDate() - deductibleDays);
-  expiryBeforeExtension.setHours(0, 0, 0, 0);
-  if (deductibleDays > 0) return expiryBeforeExtension;
-  const result = planEnd >= now ? planEnd : now;
-  result.setHours(0, 0, 0, 0);
-  return result;
+  return getDeductibleRenewalBase(subscription, now);
 }
 
 async function getRenewalWindow(prisma, ispId, subscription) {
-  const now = new Date();
-  if (!subscription) return { planStart: now, trialDeductionDays: 0 };
-  const baseStart = getRenewalBase(subscription, now);
-  if (!subscription.isTrial) return { planStart: baseStart, trialDeductionDays: 0 };
+  const now = atPlanBoundary();
+  if (Number(subscription?.graceDaysBalance || 0) + Number(subscription?.adminExtensionDays || 0) > 0) {
+    return { planStart: getRenewalBase(subscription, now), trialDeductionDays: 0 };
+  }
+  if (!subscription?.isTrial) return { planStart: getRenewalBase(subscription, now), trialDeductionDays: 0 };
   const setting = await prisma.iSPSettings.findFirst({ where: { ispId: Number(ispId), key: 'trialDeductionOnSubscriptionActivation' } });
   const trialMs = Math.max(0, new Date(subscription.planEnd) - new Date(subscription.planStart));
-  return { planStart: baseStart, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
+  return { planStart: now, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
 }
 
 /**
@@ -1157,6 +1148,7 @@ const processPayment = async (req, res, next) => {
     const durationStr = String(pkg.packageDuration || "1 month");
     const expiryDateObj = computeExpiryFromBase(renewalBase, durationStr);
     if (renewalWindow.trialDeductionDays > 0) expiryDateObj.setDate(expiryDateObj.getDate() - renewalWindow.trialDeductionDays);
+    expiryDateObj.setHours(0, 0, 0, 0);
 
     const orderItemsData = buildPackageOrderItems(pkg, otcItems, customer.isFree);
 
@@ -1229,7 +1221,9 @@ const processPayment = async (req, res, next) => {
 
       // C. Update Customer Status & Subscribed Package
       const customerUpdateData = {
-        isRechargeable: true
+        isRechargeable: true,
+        status: 'active',
+        onboardStatus: 'fully_onboarded'
       };
       if (pkg.id !== customer.subscribedPkgId) {
         customerUpdateData.subscribedPkgId = pkg.id;
@@ -1237,6 +1231,14 @@ const processPayment = async (req, res, next) => {
       await tx.customer.update({
         where: { id: customer.id },
         data: customerUpdateData
+      });
+      await tx.customerServiceConnection.updateMany({
+        where: { customerId: customer.id },
+        data: { status: 'active' }
+      });
+      await tx.connectionUser.updateMany({
+        where: { customerId: customer.id, isDeleted: false },
+        data: { isActive: true }
       });
 
       // D. Create Order Management Record
@@ -1310,9 +1312,13 @@ const processPayment = async (req, res, next) => {
               try {
                 await radius.updateExpiration(username, packageEndDate);
                 radiusProvisioned.push({ username, action: "updated", value: packageEndDate });
-                await radius.disconnectAllSessions(username).catch((disconnectError) => {
-                  console.warn(`[RADIUS] Session disconnect failed for ${username}:`, disconnectError.message);
-                });
+                if (typeof radius.disconnectUserSession === 'function') {
+                  await radius.disconnectUserSession(username);
+                } else {
+                  await radius.disconnectAllSessions(username).catch((disconnectError) => {
+                    console.warn(`[RADIUS] Session disconnect failed for ${username}:`, disconnectError.message);
+                  });
+                }
               } catch (rErr) {
                 radiusProvisioned.push({ username, action: "error", error: rErr.message });
               }
@@ -1440,6 +1446,7 @@ const confirmPayment = async (req, res) => {
       const renewalBase = renewalWindow.planStart;
       const expiryDateObj = computeExpiryFromBase(renewalBase, String(pkg.packageDuration || "1 month"));
       if (renewalWindow.trialDeductionDays > 0) expiryDateObj.setDate(expiryDateObj.getDate() - renewalWindow.trialDeductionDays);
+      expiryDateObj.setHours(0, 0, 0, 0);
 
       // Update Subscription
       const updatedSubData = {
@@ -1463,7 +1470,9 @@ const confirmPayment = async (req, res) => {
 
       // Update Customer Status & Subscribed Package
       const customerUpdateData = {
-        isRechargeable: true
+        isRechargeable: true,
+        status: 'active',
+        onboardStatus: 'fully_onboarded'
       };
       if (pkg.id !== customer.subscribedPkgId) {
         customerUpdateData.subscribedPkgId = pkg.id;
@@ -1471,6 +1480,14 @@ const confirmPayment = async (req, res) => {
       await tx.customer.update({
         where: { id: customer.id },
         data: customerUpdateData
+      });
+      await tx.customerServiceConnection.updateMany({
+        where: { customerId: customer.id },
+        data: { status: 'active' }
+      });
+      await tx.connectionUser.updateMany({
+        where: { customerId: customer.id, isDeleted: false },
+        data: { isActive: true }
       });
 
       // Mark eSewa Token as Completed
@@ -1506,10 +1523,15 @@ const confirmPayment = async (req, res) => {
       if (radius) {
         const users = await prisma.connectionUser.findMany({ where: { customerId: customer.id, isDeleted: false } });
         for (const user of users) {
+          if (!user.username) continue;
           await radius.updateExpiration(user.username, createdOrder.packageEnd);
-          await radius.disconnectAllSessions(user.username).catch((disconnectError) => {
-            console.warn(`[RADIUS] Session disconnect failed for ${user.username}:`, disconnectError.message);
-          });
+          if (typeof radius.disconnectUserSession === 'function') {
+            await radius.disconnectUserSession(user.username);
+          } else {
+            await radius.disconnectAllSessions(user.username).catch((disconnectError) => {
+              console.warn(`[RADIUS] Session disconnect failed for ${user.username}:`, disconnectError.message);
+            });
+          }
         }
       }
     } catch (re) { console.error("Radius Fail:", re.message); }
@@ -1707,9 +1729,13 @@ const initiateEpayRenewal = async (req, res, next) => {
         packageDetails: { packageId: pkg.id, packageName: pkg.packageName, source: 'EPAY_V2' }
       }
     });
-    const esewaPass = process.env.ESEWA_TEST_PASSWORD || ('Nepal' + '@' + '123');
-    const esewaToken = process.env.ESEWA_TEST_TOKEN || '123456';
-    res.json({ success: true, formUrl: epay.formUrl, fields, testCredentials: { ids: ['9711111111', '9711111112', '9711111113', '9711111114'], password: esewaPass, token: esewaToken } });
+
+    console.info('[eSewa ePay] Initiate request', {
+      url: epay.formUrl,
+      payload: fields
+    });
+
+    res.json({ success: true, formUrl: epay.formUrl, fields, testCredentials: { ids: ['9711111111', '9711111112', '9711111113', '9711111114'], password: 'Nepal@123', token: '123456' } });
   } catch (error) { next(error); }
 };
 
@@ -1771,6 +1797,7 @@ const completeEpayRenewal = async (req, res, next) => {
     const planStart = renewalWindow.planStart;
     const planEnd = computeExpiryFromBase(planStart, pkg.packageDuration);
     if (renewalWindow.trialDeductionDays > 0) planEnd.setDate(planEnd.getDate() - renewalWindow.trialDeductionDays);
+    planEnd.setHours(0, 0, 0, 0);
     const renewalItems = buildPackageOrderItems(pkg, pkg.oneTimeCharges, payment.customer.isFree);
 
     const order = await req.prisma.$transaction(async tx => {
@@ -1795,6 +1822,14 @@ const completeEpayRenewal = async (req, res, next) => {
         customerUpdateData.subscribedPkgId = pkg.id;
       }
       await tx.customer.update({ where: { id: customerId }, data: customerUpdateData });
+      await tx.customerServiceConnection.updateMany({
+        where: { customerId },
+        data: { status: 'active' }
+      });
+      await tx.connectionUser.updateMany({
+        where: { customerId, isDeleted: false },
+        data: { isActive: true }
+      });
       
       await tx.eSewaTokenPayment.update({ where: { id: payment.id }, data: { status: 'COMPLETED', paidAt: new Date(), eSewaTransactionCode: response.transaction_code, referenceCode: statusResponse.data.ref_id || response.transaction_code, orderId: String(createdOrder.id) } });
 
@@ -1814,10 +1849,15 @@ const completeEpayRenewal = async (req, res, next) => {
       const radius = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, req.ispId);
       const users = await req.prisma.connectionUser.findMany({ where: { customerId, isDeleted: false, isActive: true }, select: { username: true } });
       for (const user of users) {
+        if (!user.username) continue;
         await radius.updateExpiration(user.username, planEnd);
-        await radius.disconnectAllSessions(user.username).catch((disconnectError) => {
-          console.warn(`[RADIUS] Session disconnect failed for ${user.username}:`, disconnectError.message);
-        });
+        if (typeof radius.disconnectUserSession === 'function') {
+          await radius.disconnectUserSession(user.username);
+        } else {
+          await radius.disconnectAllSessions(user.username).catch((disconnectError) => {
+            console.warn(`[RADIUS] Session disconnect failed for ${user.username}:`, disconnectError.message);
+          });
+        }
       }
     } catch (radiusError) {
       console.warn('[eSewa ePay] Renewal completed but RADIUS expiration sync failed:', radiusError.message);

@@ -15,6 +15,8 @@ module.exports = (prisma) => {
     router.post('/esewa/base64', auth, checkPermission('settings_update'), settingsController.generateEsewaBase64);
     router.get('/esewa/config', auth, checkPermission('settings_read'), settingsController.getEsewaConfiguration);
     router.put('/esewa/config', auth, checkPermission('settings_update'), settingsController.saveEsewaConfiguration);
+    router.get('/externalpayment/config', auth, checkPermission('settings_read'), settingsController.getExternalPaymentConfiguration);
+    router.put('/externalpayment/config', auth, checkPermission('settings_update'), settingsController.saveExternalPaymentConfiguration);
     router.get('/whatsapp', auth, checkPermission('settings_read'), settingsController.getWhatsAppSettings);
     router.post('/whatsapp', auth, checkPermission('settings_update'), settingsController.updateWhatsAppSettings);
     router.post('/whatsapp/qr/generate', auth, checkPermission('settings_update'), settingsController.generateWhatsAppQr);

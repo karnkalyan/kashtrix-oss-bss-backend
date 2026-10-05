@@ -6272,6 +6272,30 @@ class ServiceController {
     }
   }
 
+  async syncAutoRadiusPasswords(req, res) {
+    try {
+      const ispId = req.ispId || 1;
+      const { syncRejectedDialInPasswords } = require('../services/radiusAutoPassword.service');
+      const result = await syncRejectedDialInPasswords(ispId, req.prisma || this.prisma);
+      return res.json(result);
+    } catch (error) {
+      console.error('Error syncing auto RADIUS passwords:', error);
+      return res.status(500).json({ success: false, error: 'Failed to sync RADIUS passwords', message: error.message });
+    }
+  }
+
+  async getRadiusAutoPasswordStatus(req, res) {
+    try {
+      const ispId = req.ispId || 1;
+      const { isAutoRadiusPasswordEnabled } = require('../services/radiusAutoPassword.service');
+      const enabled = await isAutoRadiusPasswordEnabled(ispId, req.prisma || this.prisma);
+      return res.json({ success: true, enabled });
+    } catch (error) {
+      console.error('Error getting auto RADIUS password status:', error);
+      return res.status(500).json({ success: false, error: 'Failed to get auto RADIUS password status', message: error.message });
+    }
+  }
+
 }
 
 module.exports = {

@@ -1,6 +1,7 @@
 // src/controllers/customerController.js
 const { getBranchFilter, getAllSubBranchIds } = require('../utils/branchHelper');
 const { logAudit } = require('../utils/auditLogger');
+const { logSystem } = require('../utils/systemLogger');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -10,32 +11,21 @@ const { SERVICE_CODES } = require('../lib/serviceConstants');  // <-- add this l
 const { formatRadiusExpiration } = require('../utils/radiusExpiration');
 const getDriver = require('../drivers');
 const { syncOrderToAccounting } = require('../services/accountingInvoice.service');
-const { rechargeCustomerNetTV } = require('../services/nettv-recharge.service');
-const { extractOltRxPower } = require('../utils/opticalPower');
+const { atPlanBoundary, getDeductibleRenewalBase } = require('../utils/dateHelper');
 
 function getSubscriptionRenewalBase(subscription, now = new Date()) {
-  if (!subscription) return now;
-  const planEnd = subscription?.planEnd ? new Date(subscription.planEnd) : now;
-  const deductibleDays = Math.max(0, Number(subscription?.graceDaysBalance || 0)) + Math.max(0, Number(subscription?.adminExtensionDays || 0));
-  const originalExpiry = new Date(planEnd);
-  originalExpiry.setDate(originalExpiry.getDate() - deductibleDays);
-  originalExpiry.setHours(0, 0, 0, 0);
-  if (deductibleDays > 0) {
-    return originalExpiry;
-  }
-  const result = planEnd >= now ? planEnd : now;
-  result.setHours(0, 0, 0, 0);
-  return result;
+  return getDeductibleRenewalBase(subscription, now);
 }
 
 async function getSubscriptionRenewalWindow(prisma, ispId, subscription) {
-  const now = new Date();
-  if (!subscription) return { planStart: now, trialDeductionDays: 0 };
-  const baseStart = getSubscriptionRenewalBase(subscription, now);
-  if (!subscription.isTrial) return { planStart: baseStart, trialDeductionDays: 0 };
+  const now = atPlanBoundary();
+  if (Number(subscription?.graceDaysBalance || 0) + Number(subscription?.adminExtensionDays || 0) > 0) {
+    return { planStart: getSubscriptionRenewalBase(subscription, now), trialDeductionDays: 0 };
+  }
+  if (!subscription?.isTrial) return { planStart: getSubscriptionRenewalBase(subscription, now), trialDeductionDays: 0 };
   const setting = await prisma.iSPSettings.findFirst({ where: { ispId: Number(ispId), key: 'trialDeductionOnSubscriptionActivation' } });
   const trialMs = Math.max(0, new Date(subscription.planEnd) - new Date(subscription.planStart));
-  return { planStart: baseStart, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
+  return { planStart: now, trialDeductionDays: setting?.value === 'true' ? Math.ceil(trialMs / 86400000) : 0 };
 }
 // ----------------------------------------------------------------------
 // Multer configuration
@@ -491,7 +481,9 @@ async function assertCustomerOwnsSerial(req, res, next) {
     }
 
     const { serials } = await getCustomerOwnedDeviceSerials(req.prisma, customer);
-    if (!serials.includes(serialNumber)) {
+    const targetSerial = String(serialNumber || '').trim().toLowerCase();
+    const ownsSerial = (serials || []).some(s => String(s || '').trim().toLowerCase() === targetSerial);
+    if (!ownsSerial) {
       return res.status(403).json({ success: false, error: 'You do not have access to this device.' });
     }
 
@@ -500,6 +492,19 @@ async function assertCustomerOwnsSerial(req, res, next) {
   } catch (err) {
     next(err);
   }
+}
+
+function setNepalMidnight(dateInput) {
+  const d = dateInput instanceof Date ? new Date(dateInput) : new Date(dateInput || Date.now());
+  if (isNaN(d.getTime())) return d;
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kathmandu',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(d);
+  const getVal = type => parts.find(p => p.type === type)?.value;
+  return new Date(`${getVal('year')}-${getVal('month')}-${getVal('day')}T00:00:00+05:45`);
 }
 
 /**
@@ -540,7 +545,7 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
 
   if (!durationString && durationString !== 0) {
     date.setMonth(date.getMonth() + 1);
-    return date;
+    return setNepalMidnight(date);
   }
 
   let s = String(durationString).trim().toLowerCase()
@@ -552,9 +557,9 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
   if (isoMatch) {
     const v = parseInt(isoMatch[1], 10);
     const u = isoMatch[2].toLowerCase();
-    if (u === 'd') { date.setDate(date.getDate() + v); return date; }
-    if (u === 'm') { date.setMonth(date.getMonth() + v); return date; }
-    if (u === 'y') { date.setFullYear(date.getFullYear() + v); return date; }
+    if (u === 'd') { date.setDate(date.getDate() + v); return setNepalMidnight(date); }
+    if (u === 'm') { date.setMonth(date.getMonth() + v); return setNepalMidnight(date); }
+    if (u === 'y') { date.setFullYear(date.getFullYear() + v); return setNepalMidnight(date); }
   }
 
   const re = /(\d+)\s*(?:-?\s*)?(d(?:ays?)?|day|m(?:o(?:nths?)?)?|mo|month(?:s)?|months?|y(?:ears?|r)?|yr|year(?:s)?)/i;
@@ -564,10 +569,10 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
     const anyNum = s.match(/(\d+)/);
     if (anyNum) {
       date.setMonth(date.getMonth() + parseInt(anyNum[1], 10));
-      return date;
+      return setNepalMidnight(date);
     }
     date.setMonth(date.getMonth() + 1);
-    return date;
+    return setNepalMidnight(date);
   }
 
   const value = parseInt(m[1], 10);
@@ -581,7 +586,7 @@ function computeExpiryFromBase(baseDateOrDuration, maybeDuration) {
   else if (unit === 'month') date.setMonth(date.getMonth() + value);
   else if (unit === 'year') date.setFullYear(date.getFullYear() + value);
 
-  return date;
+  return setNepalMidnight(date);
 }
 
 /**
@@ -625,7 +630,7 @@ async function generateCustomerUniqueId(tx, customerId, firstName = '', lastName
   let settingsObj = {};
   if (ispId) {
     try {
-      const settings = await tx.iSPSettings.findMany({
+      const settings = await tx.ISPSettings.findMany({
         where: { ispId }
       });
       settingsObj = settings.reduce((acc, s) => {
@@ -894,22 +899,35 @@ async function createCustomer(req, res, next) {
 
     // Fetch lead
     const lead = await prisma.lead.findFirst({
-      where: {
-        id: Number(leadId),
-        isDeleted: false,
-        ispId: req.ispId,
-        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
-      },
+      where: { id: Number(leadId), isDeleted: false, ispId: req.ispId },
     });
     if (!lead) return res.status(404).json({ success: false, error: 'Lead not found' });
-    if (lead.convertedToCustomer) return res.status(409).json({ success: false, error: 'Lead already converted' });
-    if (lead.status !== 'qualified') {
+
+    // Check if an existing customer record exists for this lead (active or deleted)
+    const existingCustomerForLead = await prisma.customer.findFirst({
+      where: { leadId: Number(leadId), ispId: req.ispId }
+    });
+
+    if (existingCustomerForLead) {
+      if (!existingCustomerForLead.isDeleted) {
+        return res.status(409).json({ success: false, error: 'Customer already exists for this lead' });
+      }
+      // If customer was deleted, we allow reactivation/re-onboarding!
+    } else if (lead.convertedToCustomer) {
+      const activeCustomer = await prisma.customer.findFirst({
+        where: { leadId: Number(leadId), isDeleted: false }
+      });
+      if (activeCustomer) {
+        return res.status(409).json({ success: false, error: 'Lead already converted' });
+      }
+    }
+
+    if (lead.status !== 'qualified' && !existingCustomerForLead?.isDeleted) {
       return res.status(400).json({ success: false, error: 'Only qualified leads can be converted to customers' });
     }
 
     const effectiveBranchId = branchId || lead.branchId;
     const effectiveSubBranchId = subBranchId || lead.subBranchId;
-    const effectiveResellerId = req.user?.resellerId ? Number(req.user.resellerId) : (lead.resellerId ? Number(lead.resellerId) : null);
 
     const requirementRows = await prisma.iSPSettings.findMany({
       where: { ispId: req.ispId, key: { in: ['customerDocumentsRequired', 'customerDeviceRequired', 'fiberOnuRequired'] } }
@@ -942,27 +960,32 @@ async function createCustomer(req, res, next) {
 
     // Validate duplicate Mobile and Email based on CustomerType rules
     const targetTypeId = customerTypeId ? Number(customerTypeId) : null;
+    const cleanLeadPhone = (lead.phoneNumber && String(lead.phoneNumber).trim()) || null;
+    const cleanLeadEmail = (lead.email && String(lead.email).trim()) || null;
+
     if (targetTypeId) {
       const cType = await prisma.customerType.findUnique({
         where: { id: targetTypeId }
       });
       if (cType) {
-        if (cType.allowDuplicateMobile === false && lead.phoneNumber) {
+        if (cType.allowDuplicateMobile === false && cleanLeadPhone) {
           const dupMobile = await prisma.customer.findFirst({
             where: {
+              ...(existingCustomerForLead?.id ? { id: { not: existingCustomerForLead.id } } : {}),
               isDeleted: false,
-              lead: { phoneNumber: lead.phoneNumber }
+              lead: { phoneNumber: cleanLeadPhone }
             }
           });
           if (dupMobile) {
             return res.status(400).json({ success: false, error: 'Mobile number already exists for another customer. Duplication is disabled for this customer type.' });
           }
         }
-        if (cType.allowDuplicateEmail === false && lead.email) {
+        if (cType.allowDuplicateEmail === false && cleanLeadEmail) {
           const dupEmail = await prisma.customer.findFirst({
             where: {
+              ...(existingCustomerForLead?.id ? { id: { not: existingCustomerForLead.id } } : {}),
               isDeleted: false,
-              lead: { email: lead.email }
+              lead: { email: cleanLeadEmail }
             }
           });
           if (dupEmail) {
@@ -986,24 +1009,12 @@ async function createCustomer(req, res, next) {
     if (!subscribedPackage) {
       return res.status(400).json({ success: false, error: 'Invalid subscribed package selected' });
     }
-    if (req.user?.resellerId) {
-      const planAssignment = await prisma.packagePlanReseller.findFirst({
-        where: {
-          packagePlanId: Number(subscribedPackage.planId),
-          resellerId: Number(req.user.resellerId)
-        },
-        select: { id: true }
-      });
-      if (!planAssignment) {
-        return res.status(403).json({ success: false, error: 'This package is not assigned to your reseller account' });
-      }
-    }
 
     const requestedLoginUsername = normalizeCustomerLoginUsername(customerLoginUsername);
     if (requestedLoginUsername) {
       const requestedLoginEmail = toCustomerLoginEmail(requestedLoginUsername);
       const existingLogin = await prisma.user.findUnique({ where: { email: requestedLoginEmail } });
-      if (existingLogin) {
+      if (existingLogin && (!existingCustomerForLead || existingLogin.customerId !== existingCustomerForLead.id)) {
         return res.status(409).json({
           success: false,
           error: 'Customer login username already exists',
@@ -1013,7 +1024,8 @@ async function createCustomer(req, res, next) {
     }
 
     // Data preparation
-    const finalPan = await generateUniquePAN(prisma, panNumber);
+    const panCandidate = panNumber || (existingCustomerForLead?.panNo ? existingCustomerForLead.panNo : null);
+    const finalPan = await generateUniquePAN(prisma, panCandidate);
     const membership = membershipId
       ? await prisma.membership.findFirst({ where: { id: Number(membershipId), ispId: req.ispId } })
       : null;
@@ -1035,34 +1047,54 @@ async function createCustomer(req, res, next) {
       const autoGenRadius = settingsObj.autoGenerateRadius === 'true';
       const autoGenLogin = settingsObj.autoGenerateCustomerLogin === 'true';
 
-      // 1. Create Customer
-      createdCustomer = await tx.customer.create({
-        data: {
-          lead: { connect: { id: lead.id } },
-          panNo: finalPan,
-          idNumber: idNumber.trim(),
-          ...(membershipId && { membership: { connect: { id: Number(membershipId) } } }),
-          ...(effectiveBranchId && { branch: { connect: { id: Number(effectiveBranchId) } } }),
-          ...(effectiveSubBranchId && { subBranch: { connect: { id: Number(effectiveSubBranchId) } } }),
-          ...(targetTypeId && { customerType: { connect: { id: targetTypeId } } }),
-          ...(req.ispId && { isp: { connect: { id: Number(req.ispId) } } }),
-          ...(effectiveResellerId && { reseller: { connect: { id: effectiveResellerId } } }),
-          ...(installedById && { installedBy: { connect: { id: Number(installedById) } } }),
-          ...(existingISPId && { existingISP: { connect: { id: Number(existingISPId) } } }),
-          packagePrice: { connect: { id: subscribedPackage.id } },
-          subscribedPkg: { connect: { id: subscribedPackage.id } },
-          status: 'draft',
-          onboardStatus: 'pending',
-          isFree: parsedIsFree,
-        }
-      });
+      // 1. Create or Reactivate Customer
+      const customerPayload = {
+        panNo: finalPan,
+        idNumber: idNumber.trim(),
+        ...(membershipId ? { membership: { connect: { id: Number(membershipId) } } } : { membership: { disconnect: true } }),
+        ...(effectiveBranchId ? { branch: { connect: { id: Number(effectiveBranchId) } } } : {}),
+        ...(effectiveSubBranchId ? { subBranch: { connect: { id: Number(effectiveSubBranchId) } } } : {}),
+        ...(targetTypeId ? { customerType: { connect: { id: targetTypeId } } } : {}),
+        ...(req.ispId ? { isp: { connect: { id: Number(req.ispId) } } } : {}),
+        ...(installedById ? { installedBy: { connect: { id: Number(installedById) } } } : {}),
+        ...(existingISPId ? { existingISP: { connect: { id: Number(existingISPId) } } } : {}),
+        packagePrice: { connect: { id: subscribedPackage.id } },
+        subscribedPkg: { connect: { id: subscribedPackage.id } },
+        status: 'draft',
+        onboardStatus: 'pending',
+        isFree: parsedIsFree,
+        isDeleted: false,
+        updatedAt: new Date()
+      };
 
-      // 2. Generate unique customer ID
-      const customerUniqueId = await generateCustomerUniqueId(tx, createdCustomer.id, lead.firstName, lead.lastName, membershipCode, effectiveBranchId, effectiveSubBranchId, req.ispId);
-      createdCustomer = await tx.customer.update({
-        where: { id: createdCustomer.id },
-        data: { customerUniqueId },
-      });
+      if (existingCustomerForLead && existingCustomerForLead.isDeleted) {
+        createdCustomer = await tx.customer.update({
+          where: { id: existingCustomerForLead.id },
+          data: customerPayload
+        });
+      } else {
+        createdCustomer = await tx.customer.create({
+          data: {
+            lead: { connect: { id: lead.id } },
+            ...customerPayload
+          }
+        });
+      }
+
+      // 2. Generate unique customer ID (preserve if already exists, or generate)
+      let customerUniqueId = (existingCustomerForLead && existingCustomerForLead.customerUniqueId) || null;
+      if (!customerUniqueId) {
+        customerUniqueId = await generateCustomerUniqueId(tx, createdCustomer.id, lead.firstName, lead.lastName, membershipCode, effectiveBranchId, effectiveSubBranchId, req.ispId);
+        createdCustomer = await tx.customer.update({
+          where: { id: createdCustomer.id },
+          data: { customerUniqueId },
+        });
+      } else {
+        createdCustomer = await tx.customer.update({
+          where: { id: createdCustomer.id },
+          data: { customerUniqueId },
+        });
+      }
 
       // Populate finalWirelessCredentials
       finalWirelessCredentials.push(...parsedWirelessCredentials);
@@ -1087,24 +1119,70 @@ async function createCustomer(req, res, next) {
             update: { isActive: true },
             create: { name: 'Customer', isActive: true },
           });
-          const existingLogin = await tx.user.findUnique({ where: { email: loginEmail } });
-          if (existingLogin) {
-            throw new Error('Customer login username already exists');
-          }
 
-          await tx.user.create({
-            data: {
-              email: loginEmail,
-              passwordHash: await bcrypt.hash(loginPassword, 10),
-              name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || customerUniqueId,
-              roleId: customerRole.id,
-              status: 'active',
-              ispId: req.ispId ? Number(req.ispId) : null,
-              branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
-              resellerId: effectiveResellerId,
-              customerId: createdCustomer.id,
-            },
+          // Check if there is already a portal user linked to this customer
+          const existingUserForCustomer = await tx.user.findUnique({
+            where: { customerId: createdCustomer.id }
           });
+          // Check if there is a portal user with this email
+          const existingUserWithEmail = await tx.user.findUnique({
+            where: { email: loginEmail }
+          });
+
+          if (existingUserWithEmail && existingUserForCustomer && existingUserWithEmail.id !== existingUserForCustomer.id) {
+            // Email is already used by a different user
+            throw new Error('Customer login username already exists');
+          } else if (existingUserWithEmail && !existingUserForCustomer) {
+            // Email matches an unlinked or existing user
+            if (existingUserWithEmail.customerId && existingUserWithEmail.customerId !== createdCustomer.id) {
+              throw new Error('Customer login username already exists');
+            }
+            await tx.user.update({
+              where: { id: existingUserWithEmail.id },
+              data: {
+                customerId: createdCustomer.id,
+                roleId: customerRole.id,
+                status: 'active',
+                isDeleted: false,
+                passwordHash: await bcrypt.hash(loginPassword, 10),
+                name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || customerUniqueId,
+                branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+                ispId: req.ispId ? Number(req.ispId) : null,
+                updatedAt: new Date()
+              }
+            });
+          } else if (existingUserForCustomer) {
+            // Re-activate and update the existing portal user for this customer
+            await tx.user.update({
+              where: { id: existingUserForCustomer.id },
+              data: {
+                email: loginEmail,
+                roleId: customerRole.id,
+                status: 'active',
+                isDeleted: false,
+                passwordHash: await bcrypt.hash(loginPassword, 10),
+                name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || customerUniqueId,
+                branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+                ispId: req.ispId ? Number(req.ispId) : null,
+                updatedAt: new Date()
+              }
+            });
+          } else {
+            // Brand new portal user
+            await tx.user.create({
+              data: {
+                email: loginEmail,
+                passwordHash: await bcrypt.hash(loginPassword, 10),
+                name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || customerUniqueId,
+                roleId: customerRole.id,
+                status: 'active',
+                isDeleted: false,
+                ispId: req.ispId ? Number(req.ispId) : null,
+                branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+                customerId: createdCustomer.id,
+              },
+            });
+          }
 
           customerLogin = {
             username: loginUsername,
@@ -1113,9 +1191,15 @@ async function createCustomer(req, res, next) {
             generatedPassword: !String(customerLoginPassword || '').trim(),
           };
         }
+      } else if (existingCustomerForLead) {
+        // If login not requested but reactivating existing customer, ensure their existing portal user is un-suspended
+        await tx.user.updateMany({
+          where: { customerId: createdCustomer.id },
+          data: { status: 'active', isDeleted: false, updatedAt: new Date() }
+        });
       }
 
-      // 3. Create Devices – handle duplicates individually
+      // 3. Create Devices – handle duplicates or reactivations individually
       if (parsedDevices.length > 0) {
         for (const device of parsedDevices) {
           try {
@@ -1126,15 +1210,50 @@ async function createCustomer(req, res, next) {
                   { serialNumber: device.serialNumber },
                   { macAddress: device.macAddress },
                 ].filter(cond => cond.serialNumber || cond.macAddress)
-              }
+              },
+              include: { customer: true }
             });
+
             if (existing) {
-              skippedDevices.push({
-                serial: device.serialNumber,
-                mac: device.macAddress,
-                reason: 'Duplicate serial or MAC'
+              if (existing.customerId === createdCustomer.id || existing.customer?.isDeleted) {
+                // Update / reassign this device record to the customer
+                await tx.customerDevice.update({
+                  where: { id: existing.id },
+                  data: {
+                    customerId: createdCustomer.id,
+                    deviceType: device.deviceType || existing.deviceType || 'ONT',
+                    brand: device.brand || existing.brand,
+                    model: device.model || existing.model,
+                    serialNumber: device.serialNumber || existing.serialNumber,
+                    macAddress: device.macAddress || existing.macAddress,
+                    ponSerial: device.ponSerial || device.serialNumber || existing.ponSerial,
+                    ponVendorIdIncluded: device.ponVendorIdIncluded !== false,
+                    provisioningStatus: 'pending',
+                    updatedAt: new Date()
+                  }
+                });
+              } else {
+                skippedDevices.push({
+                  serial: device.serialNumber,
+                  mac: device.macAddress,
+                  reason: 'Duplicate serial or MAC already assigned to another active customer'
+                });
+                continue; // skip this device
+              }
+            } else {
+              await tx.customerDevice.create({
+                data: {
+                  customerId: createdCustomer.id,
+                  deviceType: device.deviceType || 'ONT',
+                  brand: device.brand,
+                  model: device.model,
+                  serialNumber: device.serialNumber,
+                  macAddress: device.macAddress,
+                  ponSerial: device.ponSerial || device.serialNumber || null,
+                  ponVendorIdIncluded: device.ponVendorIdIncluded !== false,
+                  provisioningStatus: 'pending',
+                },
               });
-              continue; // skip this device
             }
 
             let inventoryItem = null;
@@ -1143,29 +1262,22 @@ async function createCustomer(req, res, next) {
                 where: {
                   id: Number(device.inventoryItemId),
                   ispId: req.ispId,
-                  status: 'ASSIGNED_TO_USER',
-                  userId: req.user.id,
+                  OR: [
+                    { status: 'ASSIGNED_TO_USER', userId: req.user.id },
+                    { customerId: createdCustomer.id }
+                  ]
                 },
               });
 
               if (!inventoryItem) {
-                throw new Error('Selected inventory device is not assigned to your user');
+                const anyItem = await tx.InventoryItem.findFirst({
+                  where: { id: Number(device.inventoryItemId), ispId: req.ispId }
+                });
+                if (anyItem) {
+                  inventoryItem = anyItem;
+                }
               }
             }
-
-            await tx.customerDevice.create({
-              data: {
-                customerId: createdCustomer.id,
-                deviceType: device.deviceType || 'ONT',
-                brand: device.brand,
-                model: device.model,
-                serialNumber: device.serialNumber,
-                macAddress: device.macAddress,
-                ponSerial: device.ponSerial,
-                ponVendorIdIncluded: device.ponVendorIdIncluded !== false,
-                provisioningStatus: 'pending',
-              },
-            });
 
             if (inventoryItem) {
               await tx.InventoryItem.update({
@@ -1190,6 +1302,21 @@ async function createCustomer(req, res, next) {
                 },
               });
             }
+
+            // Link TR069 device to leadId if device exists
+            const tr069Serials = [...new Set([device.serialNumber, device.ponSerial].filter(Boolean))];
+            if (tr069Serials.length > 0 && lead.id) {
+              await tx.tr069Device.updateMany({
+                where: { ispId: req.ispId, serialNumber: { in: tr069Serials } },
+                data: { leadId: lead.id, updatedAt: new Date() }
+              });
+
+              // Reactivate ONT if exists in inventory/OLT cache
+              await tx.oNT.updateMany({
+                where: { serialNumber: { in: tr069Serials } },
+                data: { isDeleted: false, status: 'online', updatedAt: new Date() }
+              });
+            }
           } catch (deviceErr) {
             // Log but don't stop the whole transaction
             console.warn('Device creation error (skipped):', deviceErr.message);
@@ -1204,6 +1331,11 @@ async function createCustomer(req, res, next) {
 
       // 4. Create Service Connection – only store fields that exist in your schema
       if (Object.keys(parsedServiceConnection).length > 0) {
+        // Clean up previous deleted service connection if reactivating
+        await tx.customerServiceConnection.deleteMany({
+          where: { customerId: createdCustomer.id }
+        });
+
         await tx.customerServiceConnection.create({
           data: {
             customerId: createdCustomer.id,
@@ -1221,15 +1353,39 @@ async function createCustomer(req, res, next) {
       // 5. Connection Users
       for (const cu of finalWirelessCredentials) {
         if (cu.username && cu.password) {
-          await tx.connectionUser.create({
-            data: {
-              customerId: createdCustomer.id,
-              username: cu.username,
-              password: cu.password,
-              branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
-              ispId: req.ispId ? Number(req.ispId) : null,
-            },
+          const existingConnUser = await tx.connectionUser.findFirst({
+            where: { username: cu.username }
           });
+          if (existingConnUser) {
+            if (existingConnUser.customerId === createdCustomer.id || existingConnUser.isDeleted) {
+              await tx.connectionUser.update({
+                where: { id: existingConnUser.id },
+                data: {
+                  customerId: createdCustomer.id,
+                  password: cu.password,
+                  branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+                  ispId: req.ispId ? Number(req.ispId) : null,
+                  isActive: true,
+                  isDeleted: false,
+                  updatedAt: new Date()
+                }
+              });
+            } else {
+              throw new Error(`Connection username "${cu.username}" already in use by another customer`);
+            }
+          } else {
+            await tx.connectionUser.create({
+              data: {
+                customerId: createdCustomer.id,
+                username: cu.username,
+                password: cu.password,
+                branchId: effectiveBranchId ? Number(effectiveBranchId) : null,
+                ispId: req.ispId ? Number(req.ispId) : null,
+                isActive: true,
+                isDeleted: false,
+              },
+            });
+          }
         }
       }
 
@@ -1246,9 +1402,14 @@ async function createCustomer(req, res, next) {
       if (autoTrialEnabled) {
         const parsedTrialDays = trialSetting ? parseInt(trialSetting.value, 10) : 3;
         const trialDays = Number.isFinite(parsedTrialDays) && parsedTrialDays > 0 ? parsedTrialDays : 3;
-        const testStart = new Date();
-        const testEnd = new Date(testStart);
-        testEnd.setDate(testEnd.getDate() + trialDays);
+        const testStart = setNepalMidnight(new Date());
+        const testEnd = setNepalMidnight(new Date(testStart.getTime() + trialDays * 24 * 60 * 60 * 1000));
+
+        // Clean up previous subscriptions if reactivating customer
+        await tx.customerSubscription.updateMany({
+          where: { customerId: createdCustomer.id },
+          data: { isActive: false, isInvoicing: false }
+        });
 
         subscription = await tx.customerSubscription.create({
           data: {
@@ -1272,7 +1433,13 @@ async function createCustomer(req, res, next) {
       // 8. Update lead
       await tx.lead.update({
         where: { id: lead.id },
-        data: { status: 'converted', convertedToCustomer: true, convertedAt: new Date() },
+        data: {
+          isDeleted: false,
+          isActive: true,
+          status: 'converted',
+          convertedToCustomer: true,
+          convertedAt: new Date()
+        },
       });
 
       await logAudit(tx, req.user.id, 'CUSTOMER_CREATE', { id: createdCustomer.id, customerUniqueId: customerUniqueId, customerTypeId: targetTypeId }, req);
@@ -1287,7 +1454,7 @@ async function createCustomer(req, res, next) {
         let radiusGroupName = '';
         if (subscribedPackage) {
           radiusGroupName = subscribedPackage.packagePlanDetails?.planCode ||
-                            subscribedPackage.referenceId ||
+                            subscribedPackage.packagePlanDetails?.planName ||
                             subscribedPackage.packageName ||
                             '';
         }
@@ -1295,6 +1462,25 @@ async function createCustomer(req, res, next) {
         const expiryDate = subscription?.planEnd ? formatRadiusExpiration(subscription.planEnd) : null;
         const attributes = {};
         if (expiryDate) attributes.Expiration = expiryDate;
+
+        let selectedNasName = null;
+        if (createdCustomer.nasId || req.body.nasId) {
+          const nasRecord = await prisma.nas.findFirst({
+            where: { id: Number(createdCustomer.nasId || req.body.nasId), ispId: req.ispId, isActive: true, isDeleted: false }
+          });
+          if (nasRecord) selectedNasName = nasRecord.nasname;
+        }
+        if (!selectedNasName) {
+          const defaultNas = await prisma.nas.findFirst({
+            where: { ispId: req.ispId, isActive: true, isDeleted: false },
+            orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }]
+          });
+          if (defaultNas) selectedNasName = defaultNas.nasname;
+        }
+        if (selectedNasName) {
+          attributes['NAS-IP-Address'] = selectedNasName;
+        }
+
         const groups = radiusGroupName ? [radiusGroupName] : [];
 
         // Get Service ID
@@ -1620,6 +1806,39 @@ async function upsertRadiusPassword(ispId, username, password) {
   });
 }
 
+async function renameRadiusUsername(ispId, oldUsername, newUsername) {
+  const client = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, ispId);
+  const [radcheck, radreply, radusergroup, destinationRadcheck] = await Promise.all([
+    client.getRadcheckByUsername(oldUsername),
+    client.getRadreply().then((entries) => Array.isArray(entries) ? entries.filter((entry) => entry.username === oldUsername) : []),
+    client.getRadusergroupByUsername(oldUsername),
+    client.getRadcheckByUsername(newUsername),
+  ]);
+  const updated = [];
+  const operations = [
+    ...(Array.isArray(radcheck) ? radcheck : []).map((entry) => ({ method: 'updateRadcheck', id: entry.id })),
+    ...(Array.isArray(radreply) ? radreply : []).map((entry) => ({ method: 'updateRadreply', id: entry.id })),
+    ...(Array.isArray(radusergroup) ? radusergroup : []).map((entry) => ({ method: 'updateRadusergroup', id: entry.id })),
+  ];
+
+  if (operations.length === 0) throw new Error(`Radius user '${oldUsername}' was not found`);
+  if (Array.isArray(destinationRadcheck) && destinationRadcheck.length > 0) {
+    throw new Error(`Radius username '${newUsername}' already exists`);
+  }
+
+  try {
+    for (const operation of operations) {
+      await client[operation.method](operation.id, { username: newUsername });
+      updated.push(operation);
+    }
+  } catch (error) {
+    await Promise.allSettled(updated.map((operation) => client[operation.method](operation.id, { username: oldUsername })));
+    throw error;
+  }
+
+  return { radcheck: radcheck.length, radreply: radreply.length, radusergroup: radusergroup.length };
+}
+
 async function getRealtimeNetworkStatus(prisma, customer) {
   let primaryDevice = null;
   let ontRealtimeStatus = 'offline';
@@ -1880,22 +2099,33 @@ async function provisionCustomer(req, res, next) {
           let result = {};
           
           const isTrial = testSubscription?.isTrial === true;
-          
           if (!isTrial || pushTrialEnabled) {
             const isAccountService = service === SERVICE_CODES.TSHUL || service === SERVICE_CODES.NEPURIX;
             let client = null;
             if (!isAccountService) {
-              client = await ServiceFactory.getClient(service, req.ispId);
+              try {
+                client = await ServiceFactory.getClient(service, req.ispId);
+              } catch (clientErr) {
+                console.warn(`[CUSTOMER ONBOARDING] Service client initialization failed for ${service}:`, clientErr.message);
+                client = null;
+              }
+              if (!client) {
+                console.log(`[CUSTOMER ONBOARDING] Skipping provisioning for ${service} because service is not configured/enabled`);
+                continue;
+              }
             }
 
             switch (service) {
               case SERVICE_CODES.TSHUL:
               case SERVICE_CODES.NEPURIX: {
                 const activeBillingClients = await ServiceFactory.getActiveBillingClients(req.ispId, prisma);
-                let clientsToProvision = activeBillingClients;
+                // Provision the accounting provider explicitly selected by the
+                // onboarding UI. Multiple configured providers must not create
+                // duplicate accounting customers.
+                let clientsToProvision = activeBillingClients.filter(item => item.code === service);
                 if (clientsToProvision.length === 0) {
-                  client = await ServiceFactory.getClient(service, req.ispId);
-                  clientsToProvision = [{ code: service, client }];
+                  console.log(`[CUSTOMER ONBOARDING] Skipping accounting provisioning for ${service} because service is not configured/enabled for ISP ${req.ispId}`);
+                  break;
                 }
 
                 const results = [];
@@ -1940,25 +2170,31 @@ async function provisionCustomer(req, res, next) {
                   ...(data.attributes || {}),
                   Expiration: formatRadiusExpiration(testSubscription.planEnd)
                 };
-                if (data.nasId) {
-                  const selectedNas = await prisma.nas.findFirst({
-                    where: { id: Number(data.nasId), ispId: req.ispId, isActive: true, isDeleted: false }
-                  });
-                  if (!selectedNas) throw new Error('Selected NAS is not available');
-                  data.attributes = { ...(data.attributes || {}), 'NAS-IP-Address': selectedNas.nasname };
-                } else {
+                let nasIp = data.attributes?.['NAS-IP-Address'];
+                if (!nasIp) {
                   const availableNas = await prisma.nas.findMany({
                     where: { ispId: req.ispId, isActive: true, isDeleted: false },
                     orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }]
                   });
-                  const fallbackNas = availableNas.find(nas => nas.isDefault) || (availableNas.length === 1 ? availableNas[0] : null);
-                  if (fallbackNas) data.attributes = { ...(data.attributes || {}), 'NAS-IP-Address': fallbackNas.nasname };
+                  let selectedNas = null;
+                  if (data.nasId) {
+                    selectedNas = availableNas.find(n => n.id === Number(data.nasId));
+                  }
+                  if (!selectedNas) {
+                    selectedNas = availableNas.find(nas => nas.isDefault) || availableNas[0] || null;
+                  }
+                  if (selectedNas) {
+                    nasIp = selectedNas.nasname;
+                  }
+                }
+                if (nasIp) {
+                  data.attributes = { ...(data.attributes || {}), 'NAS-IP-Address': nasIp };
                 }
                 if (testSubscription?.packagePrice) {
                   const radiusGroupName =
                     data.planCode ||
                     testSubscription.packagePrice.packagePlanDetails?.planCode ||
-                    (Array.isArray(data.groups) ? data.groups.find(Boolean) : null) ||
+                    testSubscription.packagePrice.packagePlanDetails?.planName ||
                     testSubscription.packagePrice.packageName;
                   if (radiusGroupName) data.groups = [radiusGroupName];
                 }
@@ -1980,7 +2216,11 @@ async function provisionCustomer(req, res, next) {
                 if (!nettvUsername) throw new Error('NetTV username is required');
                 const nettvServiceId = await getServiceIdByCode(SERVICE_CODES.NETTV);
                 const existingLink = await prisma.customerSubscribedService.findFirst({
-                  where: { serviceId: nettvServiceId, externalUsername: nettvUsername, customerId: { not: customerId } },
+                  where: {
+                    serviceId: nettvServiceId,
+                    externalUsername: nettvUsername,
+                    customerId: { not: customerId }
+                  },
                   select: { customerId: true }
                 });
                 if (existingLink) throw new Error(`NetTV username '${nettvUsername}' is already linked to another customer`);
@@ -1988,7 +2228,9 @@ async function provisionCustomer(req, res, next) {
                 result = await client.createSubscriber(subscriberData);
                 if (nettvProvisioning?.stb?.serial) {
                   await client.addSTBToSubscriber(nettvUsername, nettvProvisioning.stb);
-                  if (nettvProvisioning.package?.packages?.length) await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+                  if (nettvProvisioning.package?.packages?.length) {
+                    await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+                  }
                 }
                 const overviewData = await client.getSubscriberOverview(nettvUsername).catch(error => {
                   console.warn('Failed to fetch full overview on NetTV provision:', error.message);
@@ -2007,7 +2249,9 @@ async function provisionCustomer(req, res, next) {
             if (service !== SERVICE_CODES.TSHUL && service !== SERVICE_CODES.NEPURIX) {
               const serviceId = await getServiceIdByCode(service);
               const externalUsername = service === SERVICE_CODES.NETTV ? String(data?.username || '').trim() : null;
-              const storedServiceData = service === SERVICE_CODES.NETTV ? { ...data, ...result, username: externalUsername } : result;
+              const storedServiceData = service === SERVICE_CODES.NETTV
+                ? { ...data, ...result, username: externalUsername }
+                : result;
               await prisma.customerSubscribedService.upsert({
                 where: { customerId_serviceId: { customerId, serviceId } },
                 update: { status: 'active', externalUsername, serviceData: storedServiceData },
@@ -2132,17 +2376,15 @@ async function enrichServiceDetailsWithVlans(prisma, customers) {
     }
   }
 
-  if (vlanIdsSet.size === 0) return customers;
+  let vlanMap = new Map();
+  if (vlanIdsSet.size > 0) {
+    const vlans = await prisma.oLTVLAN.findMany({
+      where: { id: { in: Array.from(vlanIdsSet) } }
+    });
+    vlanMap = new Map(vlans.map(v => [v.id, v]));
+  }
 
-  // Fetch all VLANs in one query
-  const vlans = await prisma.oLTVLAN.findMany({
-    where: { id: { in: Array.from(vlanIdsSet) } }
-  });
-
-  // Create a map for quick lookup
-  const vlanMap = new Map(vlans.map(v => [v.id, v]));
-
-  // Enrich each service detail
+  // Enrich each service detail and sanitize OLT object to hide sensitive credentials
   for (const cust of customerArray) {
     if (cust.serviceDetails && Array.isArray(cust.serviceDetails)) {
       for (const sd of cust.serviceDetails) {
@@ -2153,6 +2395,12 @@ async function enrichServiceDetailsWithVlans(prisma, customers) {
           sd.vlanDetails = ids.map(id => vlanMap.get(id)).filter(Boolean);
         } else {
           sd.vlanDetails = [];
+        }
+
+        // Sanitize sensitive OLT SSH and SNMP credentials before sending to customer/profile APIs
+        if (sd.olt) {
+          const { sshUsername, sshPassword, sshEnablePassword, sshKey, snmpCommunity, ...safeOlt } = sd.olt;
+          sd.olt = safeOlt;
         }
       }
     }
@@ -2186,18 +2434,20 @@ async function listCustomers(req, res, next) {
       oltPort,
       subBranchId,
       branchId: queryBranchId,
-      area
+      area,
+      packageId,
+      planId,
+      connectionType
     } = req.query;
 
     const branchFilter = await getBranchFilter(req);
     const where = { 
       isDeleted: false, 
       ispId: req.ispId,
-      ...(branchFilter || {}),
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+      ...(branchFilter || {})
     };
-    if (status) where.status = status;
-    if (onboardStatus) where.onboardStatus = onboardStatus;
+    if (status && status !== 'all') where.status = status;
+    if (onboardStatus && onboardStatus !== 'all') where.onboardStatus = onboardStatus;
 
     // Extra filters for SMS campaign targeting
     // Only apply query-provided branchId if branchFilter didn't already set one (i.e. admin/global users)
@@ -2205,17 +2455,22 @@ async function listCustomers(req, res, next) {
       where.branchId = parseInt(queryBranchId);
     }
     if (subBranchId && subBranchId !== 'all') where.subBranchId = parseInt(subBranchId);
-    if (oltId && oltId !== 'all') {
-      where.serviceDetails = {
-        some: {
-          oltId: parseInt(oltId),
-          ...(oltPort && oltPort !== 'all' ? { oltPort: String(oltPort) } : {}),
-          ...(splitterId && splitterId !== 'all' ? { splitterId: parseInt(splitterId) } : {})
-        }
-      };
-    } else if (splitterId && splitterId !== 'all') {
-      where.serviceDetails = { some: { splitterId: parseInt(splitterId) } };
+
+    const serviceDetailWhere = {};
+    if (connectionType && connectionType !== 'all') {
+      serviceDetailWhere.connectionType = connectionType;
     }
+    if (oltId && oltId !== 'all') {
+      serviceDetailWhere.oltId = parseInt(oltId);
+      if (oltPort && oltPort !== 'all') serviceDetailWhere.oltPort = String(oltPort);
+      if (splitterId && splitterId !== 'all') serviceDetailWhere.splitterId = parseInt(splitterId);
+    } else if (splitterId && splitterId !== 'all') {
+      serviceDetailWhere.splitterId = parseInt(splitterId);
+    }
+    if (Object.keys(serviceDetailWhere).length > 0) {
+      where.serviceDetails = { some: serviceDetailWhere };
+    }
+
     if (area) {
       const areas = String(area).split(',').map(s => s.trim()).filter(Boolean);
       if (areas.length > 0) {
@@ -2231,17 +2486,51 @@ async function listCustomers(req, res, next) {
       }
     }
 
-    if (search) {
-      where.OR = [
-        { lead: { firstName: { contains: search } } },
-        { lead: { lastName: { contains: search } } },
-        { lead: { email: { contains: search } } },
-        { lead: { phoneNumber: { contains: search } } },
-        { lead: { secondaryContactNumber: { contains: search } } },
-        { portalUser: { email: { contains: search } } },
-        { connectionUsers: { some: { username: { contains: search }, isDeleted: false } } },
-        { customerUniqueId: { contains: search } }
+    const andConditions = [];
+
+    if (search && String(search).trim()) {
+      const q = String(search).trim();
+      const parts = q.split(/\s+/);
+      const orList = [
+        { lead: { firstName: { contains: q } } },
+        { lead: { lastName: { contains: q } } },
+        { lead: { email: { contains: q } } },
+        { lead: { phoneNumber: { contains: q } } },
+        { lead: { secondaryContactNumber: { contains: q } } },
+        { portalUser: { email: { contains: q } } },
+        { connectionUsers: { some: { username: { contains: q }, isDeleted: false } } },
+        { customerUniqueId: { contains: q } },
+        { idNumber: { contains: q } },
+        { panNo: { contains: q } }
       ];
+      if (parts.length > 1) {
+        orList.push({
+          AND: [
+            { lead: { firstName: { contains: parts[0] } } },
+            { lead: { lastName: { contains: parts.slice(1).join(' ') } } }
+          ]
+        });
+      }
+      andConditions.push({ OR: orList });
+    }
+
+    const targetPkg = packageId || planId;
+    if (targetPkg && targetPkg !== 'all') {
+      const parsedPkgId = parseInt(targetPkg);
+      if (!isNaN(parsedPkgId)) {
+        andConditions.push({
+          OR: [
+            { subscribedPkgId: parsedPkgId },
+            { assignedPkg: parsedPkgId },
+            { packagePrice: { id: parsedPkgId } },
+            { customerSubscriptions: { some: { package: parsedPkgId, isActive: true } } }
+          ]
+        });
+      }
+    }
+
+    if (andConditions.length > 0) {
+      where.AND = andConditions;
     }
 
     const fetchAll = String(limit).toLowerCase() === 'all';
@@ -2314,17 +2603,15 @@ async function listCustomers(req, res, next) {
         secondaryContactNumber: c.lead?.secondaryContactNumber || null,
         gender: c.lead?.gender,
         street: c.lead?.street,
-        city: c.lead?.city,
+        city: meta?.city || null,
         district: c.lead?.district,
         state: c.lead?.province,
-        zipCode: c.lead?.zipCode,
+        zipCode: meta?.zipCode || null,
         address: c.lead?.address,
         convertedAt: c.lead?.convertedAt,
         source: c.lead?.source || null,
         notes: c.lead?.notes || null,
         age: meta?.age || null,
-        latitude: meta?.latitude ?? null,
-        longitude: meta?.longitude ?? null,
         fullAddress: meta?.fullAddress || c.lead?.address || null,
         lead: undefined
       };
@@ -2394,21 +2681,15 @@ async function getCustomerById(req, res, next) {
     // table. Attach those definitions to every order so profile billing can
     // show the same itemized amounts, tax and TSC rules as the invoice.
     const packageIds = [...new Set((customer.orders || []).map(order => order.package).filter(Boolean))];
-    const packageLinks = packageIds.length
-      ? await req.prisma.packageonetimecharges.findMany({ where: { A: { in: packageIds } } })
+    const packagesWithCharges = packageIds.length
+      ? await req.prisma.packagePrice.findMany({
+          where: { id: { in: packageIds } },
+          include: { oneTimeCharges: { where: { isDeleted: false }, orderBy: { id: 'asc' } } }
+        })
       : [];
-    const chargeIds = [...new Set(packageLinks.map(link => link.B))];
-    const packageCharges = chargeIds.length
-      ? await req.prisma.OneTimeCharge.findMany({ where: { id: { in: chargeIds }, isDeleted: false }, orderBy: { id: 'asc' } })
-      : [];
-    const chargeById = new Map(packageCharges.map(charge => [charge.id, charge]));
     const chargesByPackage = new Map();
-    for (const link of packageLinks) {
-      const charge = chargeById.get(link.B);
-      if (!charge) continue;
-      const charges = chargesByPackage.get(link.A) || [];
-      charges.push(charge);
-      chargesByPackage.set(link.A, charges);
+    for (const pkg of packagesWithCharges) {
+      chargesByPackage.set(pkg.id, pkg.oneTimeCharges || []);
     }
     const firstOrderIdByPackage = new Map();
     for (const order of customer.orders || []) {
@@ -2446,34 +2727,19 @@ async function getCustomerById(req, res, next) {
     // Fetch realtime ONT and Radius statuses
     const realtimeNet = await getRealtimeNetworkStatus(req.prisma, customer);
 
-    // Enrich assigned hardware with both CPE and OLT-side optical readings.
-    const deviceSerials = [...new Set((customer.devices || []).flatMap(device => [device.serialNumber, device.ponSerial]).filter(Boolean))];
-    const linkedOnts = deviceSerials.length ? await req.prisma.oNT.findMany({
-      where: { ispId: req.ispId, isDeleted: false, serialNumber: { in: deviceSerials } },
-      include: { olt: { select: { id: true, name: true, vendor: true } }, ontDetails: { select: { opticalDiagnostics: true } } }
-    }) : [];
-    const ontBySerial = new Map(linkedOnts.map(ont => [String(ont.serialNumber).toUpperCase(), ont]));
+    // Let's enrich tr069Devices in response with realtime status if available
     const enrichedDevices = (customer.devices || []).map(d => {
-      const linkedOnt = ontBySerial.get(String(d.ponSerial || d.serialNumber || '').toUpperCase());
-      const optics = linkedOnt ? {
-        ontRxPower: linkedOnt.rxPower,
-        oltRxPower: extractOltRxPower(linkedOnt),
-        oltName: linkedOnt.olt?.name || null,
-        oltVendor: linkedOnt.olt?.vendor || null,
-        servicePort: linkedOnt.servicePort,
-        lastSync: linkedOnt.lastSync
-      } : {};
       if (d.serialNumber && realtimeNet.ontRealtimeStatus !== 'N/A') {
         return {
           ...d,
-          status: realtimeNet.ontRealtimeStatus,
-          ...optics
+          status: realtimeNet.ontRealtimeStatus
         };
       }
-      return { ...d, ...optics };
+      return d;
     });
 
     // Flatten lead fields
+    const leadMeta = customer.lead?.metadata ? (typeof customer.lead.metadata === 'string' ? JSON.parse(customer.lead.metadata) : customer.lead.metadata) : null;
     const response = {
       ...enrichCustomerDocumentFields(customer),
       devices: enrichedDevices,
@@ -2488,11 +2754,15 @@ async function getCustomerById(req, res, next) {
       secondaryPhone: customer.lead?.secondaryContactNumber,
       gender: customer.lead?.gender,
       street: customer.lead?.street,
-      city: customer.lead?.city,
+      city: leadMeta?.city || customer.city || '',
       district: customer.lead?.district,
       state: customer.lead?.province,
-      zipCode: customer.lead?.zipCode,
-      lead: undefined,
+      zipCode: leadMeta?.zipCode || customer.zipCode || '',
+      // Keep the source lead available to provisioning forms. Location data is
+      // commonly stored in lead.metadata and was previously discarded here.
+      lead: customer.lead,
+      latitude: customer.lead?.metadata?.latitude ?? customer.lead?.metadata?.lat ?? null,
+      longitude: customer.lead?.metadata?.longitude ?? customer.lead?.metadata?.lng ?? customer.lead?.metadata?.lon ?? null,
       ontRealtimeStatus: realtimeNet.ontRealtimeStatus,
       radiusRealtimeStatus: realtimeNet.radiusRealtimeStatus,
       radiusAccounting: realtimeNet.radiusAccounting,
@@ -2536,8 +2806,7 @@ async function getCustomerByPhoneNumber(req, res, next) {
           ]
         },
         isDeleted: false,
-        ispId: req.ispId,
-        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+        ispId: req.ispId
       },
       include: {
         lead: true,
@@ -2570,6 +2839,7 @@ async function getCustomerByPhoneNumber(req, res, next) {
     }
 
     // Flatten lead
+    const leadMeta = customer.lead?.metadata ? (typeof customer.lead.metadata === 'string' ? JSON.parse(customer.lead.metadata) : customer.lead.metadata) : null;
     const response = {
       ...enrichCustomerDocumentFields(customer),
       firstName: customer.lead?.firstName,
@@ -2580,10 +2850,10 @@ async function getCustomerByPhoneNumber(req, res, next) {
       secondaryPhone: customer.lead?.secondaryContactNumber,
       gender: customer.lead?.gender,
       street: customer.lead?.street,
-      city: customer.lead?.city,
+      city: leadMeta?.city || '',
       district: customer.lead?.district,
       state: customer.lead?.province,
-      zipCode: customer.lead?.zipCode,
+      zipCode: leadMeta?.zipCode || '',
       lead: undefined
     };
 
@@ -2613,8 +2883,8 @@ async function updateCustomer(req, res, next) {
     const {
       // Lead fields
       firstName, middleName, lastName,
-      email, phoneNumber, secondaryPhone, gender,
-      streetAddress, city, district, state, zipCode, lat, lon,
+      email, phoneNumber, secondaryPhone, secondaryContactNumber, gender,
+      streetAddress, street, city, district, state, province, zipCode, lat, lon,
 
       // Customer fields
       idNumber, panNumber,
@@ -2629,8 +2899,15 @@ async function updateCustomer(req, res, next) {
     } = req.body;
 
     const targetTypeId = customerTypeId !== undefined ? (customerTypeId ? Number(customerTypeId) : null) : existing.customerTypeId;
-    const checkPhone = phoneNumber !== undefined ? phoneNumber : existing.lead?.phoneNumber;
-    const checkEmail = email !== undefined ? email : existing.lead?.email;
+    
+    // Normalize phone, secondary phone, email to null if empty/whitespace
+    const cleanPhone = phoneNumber !== undefined ? (phoneNumber && String(phoneNumber).trim() ? String(phoneNumber).trim() : null) : undefined;
+    const cleanEmail = email !== undefined ? (email && String(email).trim() ? String(email).trim() : null) : undefined;
+    const rawSecondary = secondaryPhone !== undefined ? secondaryPhone : secondaryContactNumber;
+    const cleanSecondary = rawSecondary !== undefined ? (rawSecondary && String(rawSecondary).trim() ? String(rawSecondary).trim() : null) : undefined;
+
+    const checkPhone = cleanPhone !== undefined ? cleanPhone : existing.lead?.phoneNumber;
+    const checkEmail = cleanEmail !== undefined ? cleanEmail : existing.lead?.email;
 
     if (targetTypeId) {
       const cType = await req.prisma.customerType.findUnique({
@@ -2666,8 +2943,13 @@ async function updateCustomer(req, res, next) {
 
     // Build Customer update
     const customerUpdate = {};
-    if (idNumber !== undefined) customerUpdate.idNumber = idNumber;
-    if (panNumber !== undefined) customerUpdate.panNo = panNumber;
+    if (idNumber !== undefined) {
+      const trimmedId = idNumber ? String(idNumber).trim() : '';
+      customerUpdate.idNumber = trimmedId || existing.idNumber || String(id);
+    }
+    if (panNumber !== undefined) {
+      customerUpdate.panNo = (panNumber && String(panNumber).trim()) || null;
+    }
     if (status !== undefined) customerUpdate.status = status;
     if (onboardStatus !== undefined) customerUpdate.onboardStatus = onboardStatus;
     if (membershipId !== undefined) customerUpdate.membershipId = membershipId ? Number(membershipId) : null;
@@ -2702,20 +2984,66 @@ async function updateCustomer(req, res, next) {
 
     // Build Lead update
     const leadUpdate = {};
-    if (firstName !== undefined) leadUpdate.firstName = firstName;
-    if (middleName !== undefined) leadUpdate.middleName = middleName;
-    if (lastName !== undefined) leadUpdate.lastName = lastName;
-    if (email !== undefined) leadUpdate.email = email;
-    if (phoneNumber !== undefined) leadUpdate.phoneNumber = phoneNumber;
-    if (secondaryPhone !== undefined) leadUpdate.secondaryContactNumber = secondaryPhone;
-    if (gender !== undefined) leadUpdate.gender = gender;
-    if (streetAddress !== undefined) leadUpdate.street = streetAddress;
-    if (city !== undefined) leadUpdate.city = city;
-    if (district !== undefined) leadUpdate.district = district;
-    if (state !== undefined) leadUpdate.province = state;
-    if (zipCode !== undefined) leadUpdate.zipCode = zipCode;
-    if (lat !== undefined) leadUpdate.lat = lat ? Number(lat) : null;
-    if (lon !== undefined) leadUpdate.lon = lon ? Number(lon) : null;
+    if (firstName !== undefined) leadUpdate.firstName = (firstName && String(firstName).trim()) || null;
+    if (middleName !== undefined) leadUpdate.middleName = (middleName && String(middleName).trim()) || null;
+    if (lastName !== undefined) leadUpdate.lastName = (lastName && String(lastName).trim()) || null;
+    if (cleanEmail !== undefined) leadUpdate.email = cleanEmail;
+    if (cleanPhone !== undefined) leadUpdate.phoneNumber = cleanPhone;
+    if (cleanSecondary !== undefined) leadUpdate.secondaryContactNumber = cleanSecondary;
+    if (gender !== undefined) leadUpdate.gender = (gender && String(gender).trim()) || null;
+
+    const rawStreet = streetAddress !== undefined ? streetAddress : street;
+    const rawProvince = state !== undefined ? state : province;
+
+    if (rawStreet !== undefined) leadUpdate.street = (rawStreet && String(rawStreet).trim()) || null;
+    if (district !== undefined) leadUpdate.district = (district && String(district).trim()) || null;
+    if (rawProvince !== undefined) leadUpdate.province = (rawProvince && String(rawProvince).trim()) || null;
+
+    // city, zipCode, lat, lon belong in Lead.metadata (NOT direct columns on Lead)
+    let existingMeta = {};
+    try {
+      if (existing.lead?.metadata) {
+        existingMeta = typeof existing.lead.metadata === 'string'
+          ? JSON.parse(existing.lead.metadata)
+          : { ...existing.lead.metadata };
+      }
+    } catch (e) {
+      existingMeta = {};
+    }
+
+    let metaChanged = false;
+    if (city !== undefined) {
+      existingMeta.city = (city && String(city).trim()) || null;
+      metaChanged = true;
+    }
+    if (zipCode !== undefined) {
+      existingMeta.zipCode = (zipCode && String(zipCode).trim()) || null;
+      metaChanged = true;
+    }
+    if (lat !== undefined) {
+      existingMeta.lat = lat ? Number(lat) : null;
+      existingMeta.latitude = lat ? Number(lat) : null;
+      metaChanged = true;
+    }
+    if (lon !== undefined) {
+      existingMeta.lon = lon ? Number(lon) : null;
+      existingMeta.longitude = lon ? Number(lon) : null;
+      metaChanged = true;
+    }
+
+    if (metaChanged) {
+      leadUpdate.metadata = existingMeta;
+    }
+
+    // Update formatted address if any address component is changed
+    if (rawStreet !== undefined || city !== undefined || district !== undefined || rawProvince !== undefined) {
+      const curStreet = rawStreet !== undefined ? ((rawStreet && String(rawStreet).trim()) || null) : existing.lead?.street;
+      const curCity = city !== undefined ? ((city && String(city).trim()) || null) : existingMeta.city;
+      const curDistrict = district !== undefined ? ((district && String(district).trim()) || null) : existing.lead?.district;
+      const curProvince = rawProvince !== undefined ? ((rawProvince && String(rawProvince).trim()) || null) : existing.lead?.province;
+      const fullAddress = [curStreet, curCity, curDistrict, curProvince].filter(Boolean).join(', ');
+      leadUpdate.address = fullAddress || null;
+    }
 
     // Update Device (find first ONT device or create)
     if (deviceName !== undefined || deviceMac !== undefined || deviceBrand !== undefined || deviceSerial !== undefined || devicePonSerial !== undefined) {
@@ -2907,6 +3235,8 @@ async function updateCustomer(req, res, next) {
         await tx.lead.update({ where: { id: existing.leadId }, data: leadUpdate });
       }
       
+      await logAudit(tx, req.user.id, 'CUSTOMER_UPDATE', { id, customerTypeId: targetTypeId }, req);
+      
       return tx.customer.findUnique({
         where: { id },
         include: {
@@ -2922,23 +3252,27 @@ async function updateCustomer(req, res, next) {
       });
     });
 
-    await logAudit(req.prisma, req.user.id, 'CUSTOMER_UPDATE', { entity: 'Customer', entityId: id, before: existing, after: updated }, req);
-
     // Flatten response
+    const updatedMeta = updated?.lead?.metadata
+      ? (typeof updated.lead.metadata === 'string' ? JSON.parse(updated.lead.metadata) : updated.lead.metadata)
+      : {};
     const response = {
       ...updated,
-      firstName: updated.lead.firstName,
-      lastName: updated.lead.lastName,
-      middleName: updated.lead.middleName,
-      email: updated.lead.email,
-      phoneNumber: updated.lead.phoneNumber,
-      secondaryPhone: updated.lead.secondaryContactNumber,
-      gender: updated.lead.gender,
-      street: updated.lead.street,
-      city: updated.lead.city,
-      district: updated.lead.district,
-      state: updated.lead.province,
-      zipCode: updated.lead.zipCode,
+      firstName: updated?.lead?.firstName || '',
+      lastName: updated?.lead?.lastName || '',
+      middleName: updated?.lead?.middleName || '',
+      email: updated?.lead?.email || '',
+      phoneNumber: updated?.lead?.phoneNumber || '',
+      secondaryPhone: updated?.lead?.secondaryContactNumber || '',
+      secondaryContactNumber: updated?.lead?.secondaryContactNumber || '',
+      gender: updated?.lead?.gender || '',
+      street: updated?.lead?.street || '',
+      city: updatedMeta?.city || '',
+      district: updated?.lead?.district || '',
+      state: updated?.lead?.province || '',
+      province: updated?.lead?.province || '',
+      zipCode: updatedMeta?.zipCode || '',
+      address: updated?.lead?.address || '',
       lead: undefined
     };
 
@@ -2963,10 +3297,30 @@ async function deleteCustomer(req, res, next) {
 
     const existing = await req.prisma.customer.findUnique({
       where: { id },
-      include: { lead: true }
+      include: {
+        lead: true,
+        serviceDetails: true,
+        connectionUsers: true,
+      }
     });
     if (!existing || existing.isDeleted || existing.ispId !== req.ispId) {
       return res.status(404).json({ error: "Customer not found" });
+    }
+
+    // Teardown / disconnect RADIUS users if present
+    try {
+      const { RadiusClient } = require('../services/radiusClient');
+      const radius = await RadiusClient.create(req.ispId).catch(() => null);
+      if (radius && existing.connectionUsers) {
+        for (const cu of existing.connectionUsers) {
+          if (cu.username) {
+            await radius.deleteUser(cu.username).catch(() => {});
+            await radius.sendCoA(cu.username, { action: 'disconnect' }).catch(() => {});
+          }
+        }
+      }
+    } catch (radErr) {
+      console.warn('[deleteCustomer] Warning during RADIUS teardown:', radErr.message);
     }
 
     // Fetch all active inventory items assigned to this customer
@@ -2980,6 +3334,77 @@ async function deleteCustomer(req, res, next) {
       where: { customerId: id },
       select: { id: true, deviceType: true, brand: true, model: true, serialNumber: true, macAddress: true, ponSerial: true }
     });
+
+    // Attempt to delete ONT from physical OLT prior to database deletion
+    const oltId = Number(existing.serviceDetails?.[0]?.oltId || existing.oltId);
+    for (const device of customerDevices) {
+      const isOnt = String(device.deviceType || '').toUpperCase() === 'ONT' || Boolean(device.ponSerial);
+      if (isOnt) {
+        try {
+          const printedSerial = String(device.ponSerial || device.serialNumber || '').trim().toUpperCase();
+          const encodedSerial = /^[0-9A-F]{16}$/.test(printedSerial)
+            ? printedSerial
+            : printedSerial.length >= 8
+              ? [...printedSerial.slice(0, 4)].map(char => char.charCodeAt(0).toString(16).padStart(2, '0')).join('').toUpperCase() + printedSerial.slice(4)
+              : printedSerial;
+          const serialCandidates = [...new Set([printedSerial, encodedSerial].filter(Boolean))];
+
+          let ontRecord = null;
+          if (oltId) {
+            ontRecord = await req.prisma.oNT.findFirst({
+              where: { oltId, isDeleted: false, serialNumber: { in: serialCandidates } },
+              include: { ontDetails: true }
+            });
+          }
+          if (!ontRecord && serialCandidates.length > 0) {
+            ontRecord = await req.prisma.oNT.findFirst({
+              where: { isDeleted: false, serialNumber: { in: serialCandidates } },
+              include: { ontDetails: true }
+            });
+          }
+
+          if (ontRecord) {
+            const targetOltId = ontRecord.oltId || oltId;
+            const oltDevice = await req.prisma.oLT.findFirst({
+              where: { id: targetOltId, ispId: req.ispId, isDeleted: false }
+            });
+
+            if (oltDevice) {
+              const [frame, slot, port] = String(ontRecord.servicePort || '').split('/').map(Number);
+              const ontIdNum = Number(ontRecord.ontId);
+              if (![frame, slot, port, ontIdNum].some(val => !Number.isInteger(val) || val < 0)) {
+                const rawServicePorts = ontRecord.ontDetails?.servicePorts;
+                const servicePortRows = Array.isArray(rawServicePorts) ? rawServicePorts : [];
+                const servicePortIndices = servicePortRows
+                  .map(row => Number(row?.index ?? row?.servicePortIndex ?? row?.service_port))
+                  .filter(value => Number.isInteger(value) && value >= 0);
+
+                const driver = getDriver(oltDevice);
+                try {
+                  await driver.connect();
+                  await driver.deleteOnt({
+                    frame,
+                    slot,
+                    port,
+                    ont_id: ontIdNum,
+                    serial: printedSerial,
+                    service_port_indices: servicePortIndices
+                  });
+                } catch (driverErr) {
+                  console.warn(`[deleteCustomer] Warning: Could not delete ONT from physical OLT: ${driverErr.message}`);
+                } finally {
+                  if (driver.ssh) {
+                    try { driver.ssh.close(); } catch (closeErr) {}
+                  }
+                }
+              }
+            }
+          }
+        } catch (deviceOltErr) {
+          console.warn(`[deleteCustomer] Warning during OLT device teardown: ${deviceOltErr.message}`);
+        }
+      }
+    }
 
     await req.prisma.$transaction(async (tx) => {
       // 1. Automatically release assigned inventory items
@@ -3002,7 +3427,7 @@ async function deleteCustomer(req, res, next) {
             toEntityId: item.branchId,
             entityType: item.branchId ? 'BRANCH' : 'HEAD_OFFICE',
             actionByUserId: req.user.id,
-            note: `Released automatically via customer deletion/reversion`
+            note: `Unassigned: customer deleted`
           }
         });
       }
@@ -3013,16 +3438,19 @@ async function deleteCustomer(req, res, next) {
           where: { id: device.id }
         });
 
-        if (device.serialNumber) {
-          const ont = await tx.oNT.findFirst({
-            where: { serialNumber: device.serialNumber }
+        const printedSerial = String(device.ponSerial || device.serialNumber || '').trim().toUpperCase();
+        const encodedSerial = /^[0-9A-F]{16}$/.test(printedSerial)
+          ? printedSerial
+          : printedSerial.length >= 8
+            ? [...printedSerial.slice(0, 4)].map(char => char.charCodeAt(0).toString(16).padStart(2, '0')).join('').toUpperCase() + printedSerial.slice(4)
+            : printedSerial;
+        const serialCandidates = [...new Set([printedSerial, encodedSerial, device.serialNumber, device.ponSerial].filter(Boolean))];
+
+        if (serialCandidates.length > 0) {
+          await tx.oNT.updateMany({
+            where: { serialNumber: { in: serialCandidates } },
+            data: { isDeleted: true, status: 'unassigned', updatedAt: new Date() }
           });
-          if (ont) {
-            await tx.oNT.update({
-              where: { id: ont.id },
-              data: { isDeleted: true, updatedAt: new Date() }
-            });
-          }
         }
 
         const tr069Serials = [...new Set([device.serialNumber, device.ponSerial || device.serialNumber].filter(Boolean))];
@@ -3038,6 +3466,12 @@ async function deleteCustomer(req, res, next) {
       await tx.customer.update({
         where: { id },
         data: { isDeleted: true, status: 'deleted', onboardStatus: 'reverted_to_lead' }
+      });
+
+      // Suspend and soft-delete customer portal login
+      await tx.user.updateMany({
+        where: { customerId: id },
+        data: { status: 'suspended', isDeleted: true, updatedAt: new Date() }
       });
 
       await tx.customerSubscription.updateMany({
@@ -3066,6 +3500,11 @@ async function deleteCustomer(req, res, next) {
             convertedById: null,
             status: 'qualified'
           }
+        });
+
+        await tx.tr069Device.updateMany({
+          where: { ispId: req.ispId, leadId: existing.leadId },
+          data: { leadId: null, updatedAt: new Date() }
         });
       }
 
@@ -3198,6 +3637,7 @@ const subscribePackage = async (req, res, next) => {
     const durationStr = String(pkg.packageDuration || "1 month");
     const expiryDateObj = computeExpiryFromBase(previousPlanEnd, durationStr);
     if (renewalWindow.trialDeductionDays > 0) expiryDateObj.setDate(expiryDateObj.getDate() - renewalWindow.trialDeductionDays);
+    expiryDateObj.setHours(0, 0, 0, 0);
 
     const basePrice = customer.isFree ? 0 : (pkg.price || 0);
     const otcItemsTotal = otcItems.reduce((sum, item) => sum + item.amount, 0);
@@ -3236,13 +3676,22 @@ const subscribePackage = async (req, res, next) => {
         data: updatedSubData
       });
 
-      // FIX: update the correct field 'isRechargeable' to true after first order
-      if (!customer.isRechargeable) {
-        await tx.customer.update({
-          where: { id: customer.id },
-          data: { isRechargeable: true }
-        });
-      }
+      await tx.customer.update({
+        where: { id: customer.id },
+        data: {
+          isRechargeable: true,
+          status: 'active',
+          onboardStatus: 'fully_onboarded'
+        }
+      });
+      await tx.customerServiceConnection.updateMany({
+        where: { customerId: customer.id },
+        data: { status: 'active' }
+      });
+      await tx.connectionUser.updateMany({
+        where: { customerId: customer.id, isDeleted: false },
+        data: { isActive: true }
+      });
 
       const order = await tx.customerOrderManagement.create({
         data: {
@@ -3276,15 +3725,28 @@ const subscribePackage = async (req, res, next) => {
       console.error('[CUSTOMER RECHARGE ACCOUNTING] Sales invoice sync failed:', accountingError.message);
     }
 
-    const nettvRecharge = await rechargeCustomerNetTV({
-      prisma: req.prisma,
-      ispId: req.ispId,
-      customerId: customer.id,
-      packageId: pkg.id,
-      orderId: createdOrder.id
-    }).catch(error => ({ required: true, status: 'FAILED', message: `Internet package renewed, but NetTV recharge failed: ${error.message}` }));
-
     await logAudit(req.prisma, req.user?.id, 'CUSTOMER_PACKAGE_RENEW', { id: customer.id, packageId: pkg.id, packageName: pkg.packageName, totalAmount }, req);
+
+    try {
+      const radius = await ServiceFactory.getClient(SERVICE_CODES.RADIUS, req.ispId);
+      const users = await req.prisma.connectionUser.findMany({
+        where: { customerId: customer.id, isDeleted: false, isActive: true },
+        select: { username: true }
+      });
+      for (const user of users) {
+        if (!user.username) continue;
+        await radius.updateExpiration(user.username, expiryDateObj);
+        if (typeof radius.disconnectUserSession === 'function') {
+          await radius.disconnectUserSession(user.username);
+        } else {
+          await radius.disconnectAllSessions(user.username).catch(error => {
+            console.warn(`[CUSTOMER RECHARGE] RADIUS disconnect failed for ${user.username}:`, error.message);
+          });
+        }
+      }
+    } catch (radiusError) {
+      console.error('[CUSTOMER RECHARGE] RADIUS synchronization failed:', radiusError.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -3296,8 +3758,7 @@ const subscribePackage = async (req, res, next) => {
         packageEnd: createdOrder.packageEnd,
         totalAmount: createdOrder.totalAmount,
         items: createdOrder.items
-      },
-      nettvRecharge
+      }
     });
   } catch (err) {
     console.error("subscribePackage error:", err);
@@ -3313,7 +3774,8 @@ async function changeUsername(req, res, next) {
     const customerId = Number(req.params.id);
     if (isNaN(customerId)) return res.status(400).json({ error: "Invalid customer ID" });
 
-    const { connectionUserId, newUsername } = req.body;
+    const connectionUserId = Number(req.body.connectionUserId);
+    const newUsername = String(req.body.newUsername || '').trim();
     if (!connectionUserId || !newUsername) {
       return res.status(400).json({ error: "connectionUserId and newUsername are required" });
     }
@@ -3325,24 +3787,58 @@ async function changeUsername(req, res, next) {
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
     const connectionUser = await req.prisma.connectionUser.findFirst({
-      where: { id: Number(connectionUserId), customerId, isDeleted: false }
+      where: { id: connectionUserId, customerId, isDeleted: false, ispId: req.ispId }
     });
     if (!connectionUser) return res.status(404).json({ error: "Connection user not found" });
 
     const existing = await req.prisma.connectionUser.findFirst({
-      where: { username: newUsername, isDeleted: false, ispId: req.ispId, id: { not: Number(connectionUserId) } }
+      where: { username: newUsername, isDeleted: false, ispId: req.ispId, id: { not: connectionUserId } }
     });
     if (existing) return res.status(409).json({ error: "Username already exists" });
 
-    const updated = await req.prisma.connectionUser.update({
-      where: { id: Number(connectionUserId) },
-      data: { username: newUsername }
+    if (connectionUser.username === newUsername) {
+      return res.json({ success: true, message: "Radius username is already up to date" });
+    }
+
+    let radiusResult;
+    try {
+      radiusResult = await renameRadiusUsername(req.ispId, connectionUser.username, newUsername);
+    } catch (radiusError) {
+      await logSystem(req.prisma, {
+        ispId: req.ispId,
+        userId: req.user?.id,
+        level: 'ERROR',
+        operation: 'RADIUS_CREDENTIAL_USERNAME_CHANGE',
+        message: 'Radius username update failed',
+        details: { customerId, connectionUserId, oldUsername: connectionUser.username, newUsername, error: radiusError.message },
+      });
+      return res.status(502).json({ error: "Unable to update Radius username" });
+    }
+
+    let updated;
+    try {
+      updated = await req.prisma.connectionUser.update({
+        where: { id: connectionUserId },
+        data: { username: newUsername }
+      });
+    } catch (databaseError) {
+      await renameRadiusUsername(req.ispId, newUsername, connectionUser.username).catch(() => null);
+      throw databaseError;
+    }
+
+    await logSystem(req.prisma, {
+      ispId: req.ispId,
+      userId: req.user?.id,
+      level: 'INFO',
+      operation: 'RADIUS_CREDENTIAL_USERNAME_CHANGE',
+      message: 'Connection and Radius username updated successfully',
+      details: { customerId, connectionUserId, oldUsername: connectionUser.username, newUsername, radiusResult },
     });
 
     return res.json({
       success: true,
-      message: "Username updated successfully (database only)",
-      data: { oldUsername: connectionUser.username, newUsername: updated.username }
+      message: "Connection and Radius username updated successfully",
+      data: { oldUsername: connectionUser.username, newUsername: updated.username, radiusUpdated: true }
     });
   } catch (err) {
     console.error("changeUsername error:", err);
@@ -3500,30 +3996,47 @@ async function changeConnectionUserPassword(req, res, next) {
     if (!connectionUser) return res.status(404).json({ error: "Connection user not found" });
 
     const password = String(newPassword).trim();
-    const updated = await req.prisma.connectionUser.update({
-      where: { id: connectionUser.id },
-      data: { password }
-    });
-
-    let radiusUpdated = false;
-    let radiusMessage = null;
     try {
       await upsertRadiusPassword(req.ispId, connectionUser.username, password);
-      radiusUpdated = true;
     } catch (radiusErr) {
-      radiusMessage = radiusErr.message || "Radius password update failed";
+      await logSystem(req.prisma, {
+        ispId: req.ispId,
+        userId: req.user?.id,
+        level: 'ERROR',
+        operation: 'RADIUS_CREDENTIAL_PASSWORD_CHANGE',
+        message: 'Radius password update failed',
+        details: { customerId, connectionUserId, username: connectionUser.username, error: radiusErr.message },
+      });
+      return res.status(502).json({ error: "Unable to update Radius password" });
     }
+
+    let updated;
+    try {
+      updated = await req.prisma.connectionUser.update({
+        where: { id: connectionUser.id },
+        data: { password }
+      });
+    } catch (databaseError) {
+      await upsertRadiusPassword(req.ispId, connectionUser.username, connectionUser.password).catch(() => null);
+      throw databaseError;
+    }
+
+    await logSystem(req.prisma, {
+      ispId: req.ispId,
+      userId: req.user?.id,
+      level: 'INFO',
+      operation: 'RADIUS_CREDENTIAL_PASSWORD_CHANGE',
+      message: 'Connection and Radius password updated successfully',
+      details: { customerId, connectionUserId, username: connectionUser.username },
+    });
 
     return res.json({
       success: true,
-      message: radiusUpdated
-        ? "Connection and Radius password updated successfully"
-        : "Connection password updated locally. Radius update failed.",
+      message: "Connection and Radius password updated successfully",
       data: {
         id: updated.id,
         username: updated.username,
-        radiusUpdated,
-        radiusMessage
+        radiusUpdated: true
       }
     });
   } catch (err) {
@@ -3552,27 +4065,35 @@ async function changePackage(req, res, next) {
     });
     if (!customer) return res.status(404).json({ error: "Customer not found" });
 
-    const isGlobalAdmin = req.user.role === 'admin' || 
-                         req.user.role?.name === 'administrator' || 
-                         req.user.role?.name === 'isp_admin' || 
-                         req.user.role?.name === 'super admin' || 
-                         req.user.role?.name?.startsWith('global') ||
-                         req.user.role?.name?.toLowerCase().includes('admin');
-
-    if (!isGlobalAdmin) {
-      await req.prisma.branchRequest.create({
-        data: {
-          ispId: req.ispId,
-          branchId: req.branchId || customer.branchId || 1,
-          customerId: customerId,
-          type: 'PACKAGE_CHANGE',
-          status: 'PENDING',
-          details: JSON.stringify({ newPackageId: Number(newPackageId) }),
-          reason: req.body.reason || 'Package change requested by branch user',
-          requestedBy: req.user.id
-        }
+    if (req.body.requestApproval) {
+      const requestedPackage = await req.prisma.packagePrice.findFirst({
+        where: { id: Number(newPackageId), ispId: req.ispId, isDeleted: false, isActive: true },
+        select: { planId: true }
       });
-      return res.json({ success: true, message: "Package change request submitted to admin for approval." });
+      if (!requestedPackage) return res.status(404).json({ error: "Package not found" });
+      const branchId = customer.subBranchId || customer.branchId;
+      if (branchId && !await req.prisma.packagePlanBranch.findUnique({
+        where: { packagePlanId_branchId: { packagePlanId: requestedPackage.planId, branchId: Number(branchId) } }
+      })) return res.status(400).json({ error: "Package is not assigned to this customer branch" });
+      const targetBranch = await req.prisma.branch.findFirst({
+        where: { id: req.branchId || customer.branchId || undefined, ispId: req.ispId }
+      }) || await req.prisma.branch.findFirst({ where: { ispId: req.ispId } });
+
+      if (targetBranch) {
+        await req.prisma.branchRequest.create({
+          data: {
+            ispId: req.ispId,
+            branchId: targetBranch.id,
+            customerId: customerId,
+            type: 'PACKAGE_CHANGE',
+            status: 'PENDING',
+            details: JSON.stringify({ newPackageId: Number(newPackageId) }),
+            reason: req.body.reason || 'Package change requested by branch user',
+            requestedBy: req.user.id
+          }
+        });
+        return res.json({ success: true, message: "Package change request submitted to admin for approval." });
+      }
     }
 
     const newPackage = await req.prisma.packagePrice.findFirst({
@@ -3580,6 +4101,10 @@ async function changePackage(req, res, next) {
       include: { packagePlanDetails: true }
     });
     if (!newPackage) return res.status(404).json({ error: "Package not found" });
+    const branchId = customer.subBranchId || customer.branchId;
+    if (branchId && !await req.prisma.packagePlanBranch.findUnique({
+      where: { packagePlanId_branchId: { packagePlanId: newPackage.planId, branchId: Number(branchId) } }
+    })) return res.status(400).json({ error: "Package is not assigned to this customer branch" });
 
     let updatedSubscription;
     await req.prisma.$transaction(async (tx) => {
@@ -3590,19 +4115,22 @@ async function changePackage(req, res, next) {
       });
 
       const now = new Date();
-      const expiryDate = computeExpiryFromBase(String(newPackage.packageDuration || '1 Day'));
 
       if (customer.customerSubscriptions.length > 0) {
         const sub = customer.customerSubscriptions[0];
         updatedSubscription = await tx.customerSubscription.update({
           where: { id: sub.id },
-          data: { packagePriceId: Number(newPackageId), planEnd: expiryDate, updatedAt: now }
+          data: {
+            packagePrice: { connect: { id: Number(newPackageId) } },
+            updatedAt: now
+          }
         });
       } else {
+        const expiryDate = computeExpiryFromBase(String(newPackage.packageDuration || '1 Month'));
         updatedSubscription = await tx.customerSubscription.create({
           data: {
             customer: { connect: { id: customerId } },
-            packagePriceId: Number(newPackageId),
+            packagePrice: { connect: { id: Number(newPackageId) } },
             planStart: now,
             planEnd: expiryDate,
             isTrial: newPackage.isTrial || false,
@@ -3611,43 +4139,33 @@ async function changePackage(req, res, next) {
           }
         });
       }
-
-      // Create order for package change
-      const renewalAmount = newPackage.renewAmountWithTax !== null && newPackage.renewAmountWithTax !== undefined
-        ? Number(newPackage.renewAmountWithTax)
-        : Number(newPackage.price || 0);
-      const orderAmount = customer.isFree ? 0 : renewalAmount;
-      const baseItemPrice = customer.isFree ? 0 : (newPackage.price || 0);
-      await tx.customerOrderManagement.create({
-        data: {
-          customerId: customerId,
-          subscriptionId: updatedSubscription.id,
-          packagePriceId: Number(newPackageId),
-          packageStart: updatedSubscription.planStart,
-          packageEnd: updatedSubscription.planEnd,
-          orderDate: now,
-          totalAmount: orderAmount,
-          isActive: true,
-          isDeleted: false,
-          orderType: 'package_change',
-          items: {
-            create: [
-              {
-                itemName: `${newPackage.packageName || 'Package'} - Package Change`,
-                referenceId: newPackage.referenceId || null,
-                itemPrice: baseItemPrice
-              }
-            ]
-          }
-        }
-      });
     });
+
+    // Sync package change to RADIUS (update radusergroup and send CoA disconnect)
+    try {
+      const connectionUser = await req.prisma.connectionUser.findFirst({
+        where: { customerId, isDeleted: false }
+      });
+      if (connectionUser) {
+        const { RadiusClient } = require('../services/radiusClient');
+        const radiusClient = await RadiusClient.create(req.ispId);
+        const planCode = newPackage.packagePlanDetails?.planCode ||
+                         newPackage.packagePlanDetails?.planName ||
+                         newPackage.packageName;
+        if (planCode) {
+          await radiusClient.updateUserGroup(connectionUser.username, planCode);
+        }
+        await radiusClient.sendCoA(connectionUser.username, { action: 'disconnect' }).catch(() => {});
+      }
+    } catch (radErr) {
+      console.warn('[CHANGE PACKAGE] RADIUS update error:', radErr.message);
+    }
 
     await logAudit(req.prisma, req.user?.id, 'CUSTOMER_PACKAGE_CHANGE', { id: customerId, newPackageId: Number(newPackageId), packageName: newPackage.packageName }, req);
 
     return res.json({
       success: true,
-      message: "Package updated successfully (database only)",
+      message: "Package updated successfully",
       data: { oldPackage: customer.subscribedPkg, newPackage, subscription: updatedSubscription }
     });
   } catch (err) {
@@ -4024,16 +4542,11 @@ async function createOwnReferral(req, res, next) {
 async function getCustomerStatusSummary(req, res, next) {
   try {
     const ispId = req.ispId;
-    const scope = {
-      ispId,
-      isDeleted: false,
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
-    };
     const [total, draft, active, inactive] = await Promise.all([
-      req.prisma.customer.count({ where: scope }),
-      req.prisma.customer.count({ where: { ...scope, status: 'draft' } }),
-      req.prisma.customer.count({ where: { ...scope, status: 'active' } }),
-      req.prisma.customer.count({ where: { ...scope, status: 'inactive' } })
+      req.prisma.customer.count({ where: { ispId, isDeleted: false } }),
+      req.prisma.customer.count({ where: { ispId, status: 'draft', isDeleted: false } }),
+      req.prisma.customer.count({ where: { ispId, status: 'active', isDeleted: false } }),
+      req.prisma.customer.count({ where: { ispId, status: 'inactive', isDeleted: false } })
     ]);
 
     return res.json({
@@ -4098,19 +4611,41 @@ async function updateCustomerProvisioningStatus(req, res, next) {
   const customerId = Number(req.params.id);
   const requestedStatus = String(req.body?.status || '').trim().toLowerCase();
   if (!Number.isInteger(customerId)) return res.status(400).json({ error: 'Invalid customer ID' });
-  const status = { active: 'active', complete: 'active', completed: 'active', provisioned: 'active', pending: 'pending' }[requestedStatus];
+
+  const statusMap = { active: 'active', complete: 'active', completed: 'active', provisioned: 'active', pending: 'pending' };
+  const status = statusMap[requestedStatus];
   if (!status) return res.status(400).json({ error: 'Status must be active or pending' });
+
   try {
     const customer = await req.prisma.customer.findFirst({ where: { id: customerId, ispId: req.ispId } });
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
     const now = new Date();
     const results = await req.prisma.$transaction([
-      req.prisma.customer.update({ where: { id: customerId }, data: status === 'active' ? { status: 'active', onboardStatus: 'fully_onboarded', updatedAt: now } : { updatedAt: now } }),
-      req.prisma.customerDevice.updateMany({ where: { customerId, deviceType: 'ONT' }, data: { provisioningStatus: status, updatedAt: now } }),
-      req.prisma.customerServiceConnection.updateMany({ where: { customerId }, data: { status, provisioningNotes: `${status === 'active' ? 'Completed' : 'Reset to pending'} manually by ${req.user?.email || req.user?.id || 'operator'} on ${now.toISOString()}`, updatedAt: now } })
+      req.prisma.customer.update({
+        where: { id: customerId },
+        data: status === 'active' ? { status: 'active', onboardStatus: 'fully_onboarded', updatedAt: now } : { updatedAt: now }
+      }),
+      req.prisma.customerDevice.updateMany({
+        where: { customerId, deviceType: 'ONT' },
+        data: { provisioningStatus: status, updatedAt: now }
+      }),
+      req.prisma.customerServiceConnection.updateMany({
+        where: { customerId },
+        data: {
+          status,
+          provisioningNotes: `${status === 'active' ? 'Completed' : 'Reset to pending'} manually by ${req.user?.email || req.user?.id || 'operator'} on ${now.toISOString()}`,
+          updatedAt: now
+        }
+      })
     ]);
+
     await logAudit(req.prisma, req.user.id, 'CUSTOMER_PROVISIONING_STATUS_UPDATE', { customerId, status }, req);
-    return res.json({ success: true, message: status === 'active' ? 'Customer provisioning and assigned ONT marked active' : 'Customer provisioning and assigned ONT marked pending', data: { status, devicesUpdated: results[1].count, connectionsUpdated: results[2].count } });
+    return res.json({
+      success: true,
+      message: status === 'active' ? 'Customer provisioning and assigned ONT marked active' : 'Customer provisioning and assigned ONT marked pending',
+      data: { status, devicesUpdated: results[1].count, connectionsUpdated: results[2].count }
+    });
   } catch (error) {
     console.error('updateCustomerProvisioningStatus error:', error);
     return next(error);
@@ -4146,8 +4681,6 @@ async function deleteCustomerDevice(req, res, next) {
     let ont = null;
     if (String(device.deviceType || '').toUpperCase() === 'ONT') {
       const oltId = Number(device.customer?.serviceDetails?.[0]?.oltId || device.customer?.oltId);
-      if (!oltId) return res.status(409).json({ error: 'Cannot remove ONT: customer has no associated OLT' });
-
       const printedSerial = String(device.ponSerial || device.serialNumber || '').trim().toUpperCase();
       const encodedSerial = /^[0-9A-F]{16}$/.test(printedSerial)
         ? printedSerial
@@ -4155,38 +4688,58 @@ async function deleteCustomerDevice(req, res, next) {
           ? [...printedSerial.slice(0, 4)].map(char => char.charCodeAt(0).toString(16).padStart(2, '0')).join('').toUpperCase() + printedSerial.slice(4)
           : printedSerial;
       const serialCandidates = [...new Set([printedSerial, encodedSerial].filter(Boolean))];
-      ont = await prisma.oNT.findFirst({
-        where: { oltId, isDeleted: false, serialNumber: { in: serialCandidates } },
-        include: { ontDetails: true }
-      });
-      if (!ont) return res.status(409).json({ error: `Cannot remove ONT: ${printedSerial || 'serial'} was not found in the synchronized OLT inventory` });
 
-      const [frame, slot, port] = String(ont.servicePort || '').split('/').map(Number);
-      const ontId = Number(ont.ontId);
-      if ([frame, slot, port, ontId].some(value => !Number.isInteger(value) || value < 0)) {
-        return res.status(409).json({ error: 'Cannot remove ONT: invalid frame/slot/port or ONT ID in OLT inventory' });
-      }
-      const rawServicePorts = ont.ontDetails?.servicePorts;
-      const servicePortRows = Array.isArray(rawServicePorts) ? rawServicePorts : [];
-      const servicePortIndices = servicePortRows
-        .map(row => Number(row?.index ?? row?.servicePortIndex ?? row?.service_port))
-        .filter(value => Number.isInteger(value) && value >= 0);
-      const oltDevice = await prisma.oLT.findFirst({ where: { id: oltId, ispId: req.ispId, isDeleted: false } });
-      if (!oltDevice) return res.status(404).json({ error: 'Associated OLT was not found' });
-
-      const driver = getDriver(oltDevice);
-      try {
-        await driver.connect();
-        oltDeletion = await driver.deleteOnt({
-          frame,
-          slot,
-          port,
-          ont_id: ontId,
-          serial: printedSerial,
-          service_port_indices: servicePortIndices
+      if (oltId) {
+        ont = await prisma.oNT.findFirst({
+          where: { oltId, isDeleted: false, serialNumber: { in: serialCandidates } },
+          include: { ontDetails: true }
         });
-      } finally {
-        if (driver.ssh) driver.ssh.close();
+
+        if (ont) {
+          const [frame, slot, port] = String(ont.servicePort || '').split('/').map(Number);
+          const ontId = Number(ont.ontId);
+          const rawServicePorts = ont.ontDetails?.servicePorts;
+          const servicePortRows = Array.isArray(rawServicePorts) ? rawServicePorts : [];
+          const servicePortIndices = servicePortRows
+            .map(row => Number(row?.index ?? row?.servicePortIndex ?? row?.service_port))
+            .filter(value => Number.isInteger(value) && value >= 0);
+
+          if ([frame, slot, port, ontId].every(value => Number.isInteger(value) && value >= 0)) {
+            const oltDevice = await prisma.oLT.findFirst({ where: { id: oltId, ispId: req.ispId, isDeleted: false } });
+            if (oltDevice) {
+              const driver = getDriver(oltDevice);
+              try {
+                await driver.connect();
+                oltDeletion = await driver.deleteOnt({
+                  frame,
+                  slot,
+                  port,
+                  ont_id: ontId,
+                  serial: printedSerial,
+                  service_port_indices: servicePortIndices
+                });
+              } catch (driverErr) {
+                console.warn(`[deleteCustomerDevice] OLT deletion failed or device already removed (${driverErr.message}). Continuing with local database and inventory cleanup.`);
+                oltDeletion = {
+                  skipped: true,
+                  warning: `OLT deletion skipped or device not on OLT: ${driverErr.message}`
+                };
+              } finally {
+                if (driver && driver.ssh) {
+                  try { driver.ssh.close(); } catch (e) {}
+                }
+              }
+            } else {
+              console.warn(`[deleteCustomerDevice] Associated OLT ${oltId} not found. Continuing with local cleanup.`);
+            }
+          } else {
+            console.warn(`[deleteCustomerDevice] Invalid frame/slot/port/ontId for ONT ${ont.id}. Continuing with local cleanup.`);
+          }
+        } else {
+          console.warn(`[deleteCustomerDevice] ONT serial ${printedSerial} not found in synchronized OLT inventory. Continuing with local cleanup.`);
+        }
+      } else {
+        console.warn(`[deleteCustomerDevice] Customer has no associated OLT. Continuing with local cleanup.`);
       }
     }
 
@@ -4208,18 +4761,53 @@ async function deleteCustomerDevice(req, res, next) {
         });
       }
 
-      const tr069Serials = [...new Set([device.serialNumber, device.ponSerial].filter(Boolean))];
+      // Unlink and remove from TR069 device
+      const tr069Serials = [...new Set([device.serialNumber, device.ponSerial].filter(Boolean).map(s => String(s).trim()))];
       if (tr069Serials.length > 0) {
         await tx.tr069Device.updateMany({
-          where: { ispId: req.ispId, serialNumber: { in: tr069Serials } },
-          data: { leadId: null, updatedAt: new Date() }
+          where: {
+            ispId: req.ispId,
+            OR: [
+              { serialNumber: { in: tr069Serials } },
+              device.macAddress ? { macAddress: String(device.macAddress).trim() } : undefined
+            ].filter(Boolean)
+          },
+          data: {
+            isDeleted: true,
+            isActive: false,
+            leadId: null,
+            customerId: null,
+            updatedAt: new Date()
+          }
         });
+
+        // Also delete from GenieACS if present
+        try {
+          const genieClient = await ServiceFactory.getClient(SERVICE_CODES.GENIEACS, req.ispId).catch(() => null);
+          if (genieClient) {
+            for (const s of tr069Serials) {
+              await genieClient.deleteDevice(s).catch(err => {
+                console.warn(`[deleteCustomerDevice] Could not delete ${s} from GenieACS:`, err.message);
+              });
+            }
+          }
+        } catch (gErr) {
+          console.warn(`[deleteCustomerDevice] GenieACS deletion warning:`, gErr.message);
+        }
       }
 
       // 2. Unassign corresponding InventoryItem if it exists and is assigned to this customer
-      if (device.serialNumber) {
+      const invSerials = [...new Set([device.serialNumber, device.ponSerial].filter(Boolean).map(s => String(s).trim()))];
+      for (const s of invSerials) {
         const invItem = await tx.InventoryItem.findFirst({
-          where: { serialNumber: device.serialNumber, customerId, ispId: req.ispId }
+          where: {
+            ispId: req.ispId,
+            OR: [
+              { serialNumber: s },
+              { ponSerialNumber: s }
+            ],
+            customerId
+          }
         });
         if (invItem) {
           const targetStatus = invItem.branchId ? 'ASSIGNED_TO_BRANCH' : 'IN_STOCK';
@@ -4239,14 +4827,16 @@ async function deleteCustomerDevice(req, res, next) {
               toStatus: targetStatus,
               toEntityId: invItem.branchId,
               entityType: invItem.branchId ? 'BRANCH' : 'HEAD_OFFICE',
-              actionByUserId: req.user.id,
-              note: `Unassigned via customer device deletion of serial: ${device.serialNumber}`
+              actionByUserId: req.user?.id || null,
+              note: `Unassigned via customer device deletion of serial: ${s}`
             }
           });
         }
       }
 
-      await logAudit(tx, req.user.id, 'CUSTOMER_DEVICE_DELETE', { customerId, deviceId, serialNumber: device.serialNumber }, req);
+      if (req.user?.id) {
+        await logAudit(tx, req.user.id, 'CUSTOMER_DEVICE_DELETE', { customerId, deviceId, serialNumber: device.serialNumber }, req);
+      }
     });
 
     return res.json({ success: true, message: 'Device deleted successfully', oltDeletion });
@@ -4587,8 +5177,16 @@ async function reprovisionRadius(req, res, next) {
           data: { username, password }
         });
       } else {
-        await prisma.connectionUser.create({
-          data: {
+        await prisma.connectionUser.upsert({
+          where: { username },
+          update: {
+            password,
+            customerId,
+            branchId: customer.branchId,
+            ispId: req.ispId,
+            isDeleted: false
+          },
+          create: {
             customerId,
             username,
             password,
@@ -4626,7 +5224,7 @@ async function reprovisionRadius(req, res, next) {
         include: { packagePlanDetails: true }
       });
       radiusGroupName = packagePrice?.packagePlanDetails?.planCode ||
-                        packagePrice?.referenceId ||
+                        packagePrice?.packagePlanDetails?.planName ||
                         packagePrice?.packageName ||
                         '';
     }
@@ -4662,6 +5260,25 @@ async function reprovisionRadius(req, res, next) {
     // Create user in Radius
     const attributes = {};
     if (expiryDate) attributes.Expiration = expiryDate;
+
+    let selectedNasName = null;
+    if (customer.nasId) {
+      const nasRecord = await prisma.nas.findFirst({
+        where: { id: Number(customer.nasId), ispId: req.ispId, isActive: true, isDeleted: false }
+      });
+      if (nasRecord) selectedNasName = nasRecord.nasname;
+    }
+    if (!selectedNasName) {
+      const defaultNas = await prisma.nas.findFirst({
+        where: { ispId: req.ispId, isActive: true, isDeleted: false },
+        orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }]
+      });
+      if (defaultNas) selectedNasName = defaultNas.nasname;
+    }
+    if (selectedNasName) {
+      attributes['NAS-IP-Address'] = selectedNasName;
+    }
+
     const groups = radiusGroupName ? [radiusGroupName] : [];
 
     const result = await client.createUser(
@@ -4744,11 +5361,6 @@ async function syncNettv(req, res, next) {
 
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    const username = customer.customerUniqueId;
-    if (!username) {
-      return res.status(400).json({ error: 'Customer has no unique username associated' });
-    }
-
     const getServiceIdByCode = async (code) => {
       const ispService = await prisma.iSPService.findFirst({
         where: {
@@ -4771,18 +5383,33 @@ async function syncNettv(req, res, next) {
       return res.status(400).json({ error: 'NetTV service not available for this ISP' });
     }
 
+    const subscribedService = await prisma.customerSubscribedService.findUnique({
+      where: { customerId_serviceId: { customerId, serviceId } }
+    });
+    const storedData = subscribedService?.serviceData && typeof subscribedService.serviceData === 'object'
+      ? subscribedService.serviceData
+      : {};
+    const username = String(
+      subscribedService?.externalUsername || storedData.username || storedData.subscriber?.username || ''
+    ).trim();
+    if (!username) {
+      return res.status(400).json({ error: 'This customer has no linked NetTV username. Provision NetTV and enter the subscriber username first.' });
+    }
+
     const client = await ServiceFactory.getClient(SERVICE_CODES.NETTV, req.ispId);
     
     // Fetch overview from NetTV API
     const overviewData = await client.getSubscriberOverview(username);
     
     // Store in local DB
-    const localStatus = overviewData?.subscriber?.status === 1 ? 'active' : 'inactive';
-
+    const remoteStatus = overviewData?.subscriber?.status;
+    const localStatus = remoteStatus === 0 || remoteStatus === '0' ? 'inactive' : 'active';
+    
     const updatedSubscribedService = await prisma.customerSubscribedService.upsert({
       where: { customerId_serviceId: { customerId, serviceId } },
       update: { 
         status: localStatus, 
+        externalUsername: username,
         serviceData: {
           username,
           ...overviewData,
@@ -4793,6 +5420,7 @@ async function syncNettv(req, res, next) {
         customerId, 
         serviceId, 
         status: localStatus, 
+        externalUsername: username,
         serviceData: {
           username,
           ...overviewData,
@@ -4869,19 +5497,36 @@ async function reprovisionNettv(req, res, next) {
     nettvData.username = nettvUsername;
 
     const existingLink = await prisma.customerSubscribedService.findFirst({
-      where: { serviceId, externalUsername: nettvUsername, customerId: { not: customerId } },
+      where: {
+        serviceId,
+        externalUsername: nettvUsername,
+        customerId: { not: customerId }
+      },
       select: { customerId: true }
     });
-    if (existingLink) return res.status(409).json({ error: `NetTV username '${nettvUsername}' is already linked to another customer` });
+    if (existingLink) {
+      return res.status(409).json({ error: `NetTV username '${nettvUsername}' is already linked to another customer` });
+    }
 
     const client = await ServiceFactory.getClient(SERVICE_CODES.NETTV, req.ispId);
     
     // Reprovision is equivalent to calling createSubscriber to upsert/update configuration on NetTV
     const { provisioning: nettvProvisioning, ...subscriberData } = nettvData;
-    const result = await client.createSubscriber(subscriberData);
+    const normalizedSubscriberData = {
+      ...subscriberData,
+      has_ratv: subscriberData.has_ratv === 0 || subscriberData.has_ratv === '0' ? 0 : 1,
+      status: subscriberData.status === 0 || subscriberData.status === '0' ? 0 : 1
+    };
+    const subscriberGroupId = Number(subscriberData.subscriber_group_id || nettvProvisioning?.subscriber_group_id || 6);
+    delete normalizedSubscriberData.subscriber_group_id;
+    const result = await client.createSubscriber(normalizedSubscriberData);
+    const subscriberId = result?.subscriber?.id || result?.data?.id || result?.id;
+    if (subscriberId && subscriberGroupId) await client.assignSubscriberGroup(subscriberId, subscriberGroupId);
     if (nettvProvisioning?.stb?.serial) {
       await client.addSTBToSubscriber(nettvUsername, nettvProvisioning.stb);
-      if (nettvProvisioning.package?.packages?.length) await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+      if (nettvProvisioning.package?.packages?.length) {
+        await client.subscribePackages(nettvProvisioning.stb.serial, nettvProvisioning.package);
+      }
     }
 
     // Fetch full overview details right after provision to keep local DB fully in sync
@@ -4902,6 +5547,9 @@ async function reprovisionNettv(req, res, next) {
       create: { customerId, serviceId, status: 'active', externalUsername: nettvUsername, serviceData: finalNettvData }
     });
 
+    // A successful manual retry completes the same local lifecycle work as the
+    // add-customer provisioning flow, so profiles do not remain PENDING after
+    // NetTV has actually been provisioned.
     await prisma.$transaction([
       prisma.customer.update({ where: { id: customerId }, data: { status: 'active', onboardStatus: 'fully_onboarded' } }),
       prisma.customerDevice.updateMany({ where: { customerId, deviceType: 'ONT' }, data: { provisioningStatus: 'active' } }),
@@ -4915,7 +5563,7 @@ async function reprovisionNettv(req, res, next) {
     });
   } catch (error) {
     console.error('Error reprovisioning NetTV:', error);
-    return res.status(500).json({ error: 'NetTV reprovisioning failed', details: error.message });
+    return res.status(500).json({ error: error.message || 'NetTV reprovisioning failed', message: error.message, details: error.message });
   }
 }
 

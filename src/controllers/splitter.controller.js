@@ -337,8 +337,7 @@ async function createSplitter(req, res, next) {
     const calculatedAvailablePorts = calculatedPortCount - calculatedUsedPorts;
 
     // Generate splitter ID if not provided
-    let finalSplitterId = splitterId || `SPL-${Date.now().toString(36)}${Math.random().toString(36).substr(2, 4)}`.toUpperCase();
-    let finalName = name;
+    const finalSplitterId = splitterId || `SPL-${Date.now().toString(36)}${Math.random().toString(36).substr(2, 4)}`.toUpperCase();
 
     let oltId = null;
 
@@ -422,27 +421,11 @@ async function createSplitter(req, res, next) {
       if (masterSplitter.availablePorts <= 0) {
         return res.status(400).json({ error: "Master splitter has no available ports" });
       }
-
-      if (!splitterId) {
-        const siblings = await req.prisma.splitter.findMany({
-          where: { ispId: req.ispId, isDeleted: false, masterSplitterId: masterSplitter.splitterId },
-          select: { splitterId: true }
-        });
-        const escapedParentId = masterSplitter.splitterId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const suffixPattern = new RegExp(`^${escapedParentId}-sl-(\\d+)$`, 'i');
-        const lastNumber = siblings.reduce((max, sibling) => {
-          const match = String(sibling.splitterId || '').match(suffixPattern);
-          return match ? Math.max(max, Number(match[1])) : max;
-        }, 0);
-        const nextNumber = String(lastNumber + 1).padStart(2, '0');
-        finalSplitterId = `${masterSplitter.splitterId}-sl-${nextNumber}`;
-        if (!finalName) finalName = `${masterSplitter.name} Slave ${nextNumber}`;
-      }
     }
 
     // Create splitter
     const splitterData = {
-      name: finalName || finalSplitterId,
+      name,
       splitterId: finalSplitterId,
       splitRatio,
       splitterType,
@@ -928,19 +911,18 @@ async function updateSplitter(req, res, next) {
 async function deleteSplitter(req, res, next) {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid splitter ID" });
+    const idParam = String(req.params.id || '');
 
     const existing = await req.prisma.splitter.findFirst({
       where: {
-        id,
+        OR: [
+          ...(!isNaN(id) ? [{ id }] : []),
+          { splitterId: idParam }
+        ],
         isDeleted: false,
         ispId: req.ispId
       },
       include: {
-        customers: {
-          where: { isDeleted: false, status: 'active' },
-          select: { id: true }
-        },
         slaveSplitters: {
           where: { isDeleted: false },
           select: { id: true, name: true }
@@ -952,18 +934,48 @@ async function deleteSplitter(req, res, next) {
       return res.status(404).json({ error: "Splitter not found" });
     }
 
-    // Check if splitter has active customers
-    if (existing.customers.length > 0) {
-      return res.status(400).json({
-        error: "Cannot delete splitter with active customers. Reassign customers first."
-      });
-    }
-
     // Check if master splitter has slave splitters
     if (existing.isMaster && existing.slaveSplitters.length > 0) {
       return res.status(400).json({
         error: "Cannot delete master splitter with slave splitters. Delete or reassign slave splitters first.",
         slaveSplitters: existing.slaveSplitters.map(s => ({ id: s.id, name: s.name }))
+      });
+    }
+
+    // Check if splitter has any connected customers or ONTs
+    const connectedCustomers = await req.prisma.customer.findMany({
+      where: {
+        isDeleted: false,
+        OR: [
+          { splitterId: existing.id },
+          { serviceDetails: { some: { splitterId: existing.id } } }
+        ]
+      },
+      include: {
+        devices: {
+          select: { id: true, deviceType: true, serialNumber: true }
+        }
+      }
+    });
+
+    // Check if there is an ONT in the current splitter
+    const customersWithOnt = connectedCustomers.filter(c =>
+      c.devices && c.devices.some(d =>
+        String(d.deviceType || '').toUpperCase().includes('ONT') ||
+        String(d.deviceType || '').toUpperCase().includes('ONU') ||
+        Boolean(d.serialNumber)
+      )
+    );
+
+    if (customersWithOnt.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete splitter: ${customersWithOnt.length} ONT device(s) are connected to this splitter. Please remove or reassign the ONT(s) first.`
+      });
+    }
+
+    if (connectedCustomers.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete splitter: ${connectedCustomers.length} customer(s) are currently connected to this splitter. Please reassign customers first.`
       });
     }
 
@@ -978,30 +990,33 @@ async function deleteSplitter(req, res, next) {
       });
 
       if (master) {
+        const nextUsed = Math.max(0, (master.usedPorts || 1) - 1);
+        const nextAvailable = Math.min(master.portCount, (master.availablePorts || 0) + 1);
         await req.prisma.splitter.update({
           where: { id: master.id },
           data: {
-            usedPorts: { decrement: 1 },
-            availablePorts: { increment: 1 }
+            usedPorts: nextUsed,
+            availablePorts: nextAvailable
           }
         });
       }
     }
 
-    // Soft delete splitter
+    // Soft delete splitter & unlink master
     await req.prisma.splitter.update({
-      where: { id },
+      where: { id: existing.id },
       data: {
         isDeleted: true,
         isActive: false,
-        status: 'inactive'
+        status: 'inactive',
+        masterSplitterId: null
       }
     });
 
     return res.json({
       success: true,
       message: "Splitter deleted successfully",
-      id: id.toString()
+      id: existing.id.toString()
     });
   } catch (err) {
     console.error("deleteSplitter error:", err);

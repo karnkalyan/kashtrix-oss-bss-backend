@@ -5,6 +5,7 @@ const {
     togglePause,
     addAdjustmentItem,
     removeAdjustmentItem,
+    applyDiscount,
     payOrder,
     renewSubscription,
     generateManualInvoice,
@@ -40,6 +41,8 @@ module.exports = (prisma) => {
     router.post('/pause-play', checkAnyPermission(['billing_update', 'customer_update']), togglePause);
     router.post('/adjustments/add', checkPermission('billing_update'), addAdjustmentItem);
     router.post('/adjustments/remove', checkPermission('billing_update'), removeAdjustmentItem);
+    router.post('/adjustments/discount', checkPermission('billing_update'), applyDiscount);
+    router.post('/invoices/discount', checkPermission('billing_update'), applyDiscount);
     router.post('/pay', checkPermission('billing_update'), payOrder);
     router.post('/update-payment-mode', checkPermission('billing_update'), updatePaymentMode);
     router.post('/renew', checkAnyPermission(['billing_create', 'billing_read_self', 'customer_read']), renewSubscription);

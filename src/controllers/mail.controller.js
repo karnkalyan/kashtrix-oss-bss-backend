@@ -3,37 +3,7 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 
 async function ensureMailTables(prisma) {
-    await prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS mail_messages (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            ispId INT NOT NULL,
-            userId INT NOT NULL,
-            folder VARCHAR(32) NOT NULL,
-            imapUid INT NULL,
-            fromEmail VARCHAR(255) NULL,
-            toEmails TEXT NULL,
-            subject VARCHAR(500) NULL,
-            body LONGTEXT NULL,
-            messageId VARCHAR(255) NULL,
-            attachmentsJson LONGTEXT NULL,
-            isRead BOOLEAN DEFAULT FALSE,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-            INDEX mail_messages_isp_user_folder_idx (ispId, userId, folder)
-        )
-    `);
-    for (const statement of [
-        'ALTER TABLE mail_messages ADD COLUMN imapUid INT NULL',
-        'ALTER TABLE mail_messages ADD COLUMN attachmentsJson LONGTEXT NULL',
-        'ALTER TABLE mail_messages ADD INDEX mail_messages_imap_uid_idx (ispId, userId, folder, imapUid)'
-    ]) {
-        try {
-            await prisma.$executeRawUnsafe(statement);
-        } catch (error) {
-            if (!/Duplicate column|Duplicate key name|already exists/i.test(error.message || '')) {
-                throw error;
-            }
-        }
-    }
+    // Table is managed by Prisma (MailMessage model)
 }
 
 async function getMailSettings(prisma, ispId) {
@@ -178,17 +148,20 @@ async function sendManualMail(req, res, next) {
         const sent = results.filter(result => result.success).length;
         if (sent > 0) {
             const settings = await getMailSettings(req.prisma, ispId);
-            await req.prisma.$executeRawUnsafe(
-                `INSERT INTO mail_messages (ispId, userId, folder, fromEmail, toEmails, subject, body, messageId, isRead, createdAt)
-                 VALUES (?, ?, 'sent', ?, ?, ?, ?, ?, true, NOW())`,
-                ispId,
-                req.user.id,
-                settings.smtpFrom || settings.smtpUser || null,
-                uniqueEmails.join(', '),
-                subject,
-                message,
-                results.find(result => result.messageId)?.messageId || null
-            );
+            await req.prisma.mailMessage.create({
+                data: {
+                    ispId,
+                    userId: req.user.id,
+                    folder: 'sent',
+                    fromEmail: settings.smtpFrom || settings.smtpUser || null,
+                    toEmails: uniqueEmails.join(', '),
+                    subject,
+                    body: message,
+                    messageId: results.find(result => result.messageId)?.messageId || null,
+                    isRead: true,
+                    createdAt: new Date()
+                }
+            });
         }
 
         res.json({ success: sent > 0, sent, failed: results.length - sent });
@@ -200,15 +173,11 @@ async function sendManualMail(req, res, next) {
 async function getSentMail(req, res, next) {
     try {
         await ensureMailTables(req.prisma);
-        const rows = await req.prisma.$queryRawUnsafe(
-            `SELECT id, imapUid, fromEmail, toEmails, subject, body, messageId, attachmentsJson, isRead, createdAt
-             FROM mail_messages
-             WHERE ispId = ? AND userId = ? AND folder = 'sent'
-             ORDER BY createdAt DESC
-             LIMIT 100`,
-            req.ispId,
-            req.user.id
-        );
+        const rows = await req.prisma.mailMessage.findMany({
+            where: { ispId: Number(req.ispId), userId: Number(req.user.id), folder: 'sent' },
+            orderBy: { createdAt: 'desc' },
+            take: 100
+        });
         res.json(parseDbMailRows(rows));
     } catch (err) {
         next(err);
@@ -218,15 +187,11 @@ async function getSentMail(req, res, next) {
 async function getInboxMail(req, res, next) {
     try {
         await ensureMailTables(req.prisma);
-        const rows = await req.prisma.$queryRawUnsafe(
-            `SELECT id, imapUid, fromEmail, toEmails, subject, body, messageId, attachmentsJson, isRead, createdAt
-             FROM mail_messages
-             WHERE ispId = ? AND userId = ? AND folder = 'inbox'
-             ORDER BY createdAt DESC
-             LIMIT 100`,
-            req.ispId,
-            req.user.id
-        );
+        const rows = await req.prisma.mailMessage.findMany({
+            where: { ispId: Number(req.ispId), userId: Number(req.user.id), folder: 'inbox' },
+            orderBy: { createdAt: 'desc' },
+            take: 100
+        });
         res.json({ configured: true, data: parseDbMailRows(rows) });
     } catch (err) {
         next(err);
@@ -251,14 +216,12 @@ async function refreshInboxMail(req, res, next) {
         const lock = await client.getMailboxLock('INBOX');
         try {
             const total = client.mailbox.exists || 0;
-            const [latest] = await req.prisma.$queryRawUnsafe(
-                `SELECT MAX(imapUid) AS maxUid
-                 FROM mail_messages
-                 WHERE ispId = ? AND userId = ? AND folder = 'inbox'`,
-                req.ispId,
-                req.user.id
-            );
-            const maxUid = Number(latest?.maxUid || 0);
+            const latest = await req.prisma.mailMessage.findFirst({
+                where: { ispId: Number(req.ispId), userId: Number(req.user.id), folder: 'inbox' },
+                orderBy: { imapUid: 'desc' },
+                select: { imapUid: true }
+            });
+            const maxUid = Number(latest?.imapUid || 0);
             const range = maxUid > 0 ? `${maxUid + 1}:*` : `${Math.max(1, total - 49)}:*`;
             const fetchOptions = maxUid > 0 ? { uid: true } : undefined;
             let synced = 0;
@@ -272,13 +235,16 @@ async function refreshInboxMail(req, res, next) {
                     bodyStructure: false,
                     internalDate: true
                 }, fetchOptions)) {
-                    const existing = await req.prisma.$queryRawUnsafe(
-                        `SELECT id FROM mail_messages WHERE ispId = ? AND userId = ? AND folder = 'inbox' AND imapUid = ? LIMIT 1`,
-                        req.ispId,
-                        req.user.id,
-                        msg.uid
-                    );
-                    if (existing.length) continue;
+                    const existing = await req.prisma.mailMessage.findFirst({
+                        where: {
+                            ispId: Number(req.ispId),
+                            userId: Number(req.user.id),
+                            folder: 'inbox',
+                            imapUid: msg.uid
+                        },
+                        select: { id: true }
+                    });
+                    if (existing) continue;
 
                     const parsed = msg.source ? await simpleParser(msg.source).catch(() => null) : null;
                     const attachments = (parsed?.attachments || []).map((attachment, index) => ({
@@ -288,34 +254,31 @@ async function refreshInboxMail(req, res, next) {
                         size: attachment.size
                     }));
 
-                    await req.prisma.$executeRawUnsafe(
-                        `INSERT INTO mail_messages (ispId, userId, folder, imapUid, fromEmail, toEmails, subject, body, messageId, attachmentsJson, isRead, createdAt)
-                         VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        req.ispId,
-                        req.user.id,
-                        msg.uid,
-                        msg.envelope?.from?.map(item => item.address).join(', ') || '',
-                        msg.envelope?.to?.map(item => item.address).join(', ') || '',
-                        parsed?.subject || msg.envelope?.subject || '(no subject)',
-                        parsed?.text || stripHtml(parsed?.html || ''),
-                        msg.envelope?.messageId || null,
-                        JSON.stringify(attachments),
-                        Array.from(msg.flags || []).includes('\\Seen') ? 1 : 0,
-                        msg.internalDate || msg.envelope?.date || new Date()
-                    );
+                    await req.prisma.mailMessage.create({
+                        data: {
+                            ispId: Number(req.ispId),
+                            userId: Number(req.user.id),
+                            folder: 'inbox',
+                            imapUid: msg.uid,
+                            fromEmail: msg.envelope?.from?.map(item => item.address).join(', ') || '',
+                            toEmails: msg.envelope?.to?.map(item => item.address).join(', ') || '',
+                            subject: parsed?.subject || msg.envelope?.subject || '(no subject)',
+                            body: parsed?.text || stripHtml(parsed?.html || ''),
+                            messageId: msg.envelope?.messageId || null,
+                            attachmentsJson: JSON.stringify(attachments),
+                            isRead: Array.from(msg.flags || []).includes('\\Seen'),
+                            createdAt: msg.internalDate || msg.envelope?.date || new Date()
+                        }
+                    });
                     synced++;
                 }
             }
 
-            const rows = await req.prisma.$queryRawUnsafe(
-                `SELECT id, imapUid, fromEmail, toEmails, subject, body, messageId, attachmentsJson, isRead, createdAt
-                 FROM mail_messages
-                 WHERE ispId = ? AND userId = ? AND folder = 'inbox'
-                 ORDER BY createdAt DESC
-                 LIMIT 100`,
-                req.ispId,
-                req.user.id
-            );
+            const rows = await req.prisma.mailMessage.findMany({
+                where: { ispId: Number(req.ispId), userId: Number(req.user.id), folder: 'inbox' },
+                orderBy: { createdAt: 'desc' },
+                take: 100
+            });
             res.json({ configured: true, synced, data: parseDbMailRows(rows) });
         } finally {
             lock.release();
@@ -333,13 +296,16 @@ async function downloadInboxAttachment(req, res, next) {
         await ensureMailTables(req.prisma);
         const mailId = Number(req.params.id);
         const index = Number(req.params.index);
-        const rows = await req.prisma.$queryRawUnsafe(
-            `SELECT imapUid FROM mail_messages WHERE id = ? AND ispId = ? AND userId = ? AND folder = 'inbox' LIMIT 1`,
-            mailId,
-            req.ispId,
-            req.user.id
-        );
-        const uid = Number(rows[0]?.imapUid || 0);
+        const row = await req.prisma.mailMessage.findFirst({
+            where: {
+                id: mailId,
+                ispId: Number(req.ispId),
+                userId: Number(req.user.id),
+                folder: 'inbox'
+            },
+            select: { imapUid: true }
+        });
+        const uid = Number(row?.imapUid || 0);
         const imap = await getImapClient(req.prisma, req.ispId);
 
         if (!imap.configured) {

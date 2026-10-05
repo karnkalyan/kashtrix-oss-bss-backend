@@ -24,6 +24,8 @@ async function createLead(req, res, next) {
       street,
       district,
       province,
+      city,
+      zipCode,
       gender,
       age,
       fullAddress,
@@ -31,16 +33,6 @@ async function createLead(req, res, next) {
       longitude,
       serviceRadius
     } = req.body;
-    const effectiveResellerId = req.user?.resellerId
-      ? Number(req.user.resellerId)
-      : (req.body.resellerId ? Number(req.body.resellerId) : null);
-    if (effectiveResellerId) {
-      const reseller = await req.prisma.reseller.findFirst({
-        where: { id: effectiveResellerId, ispId: Number(req.ispId), isDeleted: false, isActive: true },
-        select: { id: true }
-      });
-      if (!reseller) return res.status(400).json({ error: 'Invalid reseller assignment' });
-    }
 
     // Validate branch and sub-branch based on global system settings
     const branchValidationSetting = await req.prisma.iSPSettings.findFirst({
@@ -63,17 +55,16 @@ async function createLead(req, res, next) {
     const leadData = {
       firstName: firstName || 'Unknown',
       lastName: lastName || 'Unknown',
-      email: email || `${Date.now()}@unknown.com`,
-      phoneNumber: phoneNumber || '0000000000',
+      email: email ? email.trim() : null,
+      phoneNumber: phoneNumber ? phoneNumber.trim() : null,
       source: source || 'other',
       status: status || 'new',
       ispId: req.ispId ? Number(req.ispId) : null,
       branchId: branchId ? Number(branchId) : null,
       subBranchId: subBranchId ? Number(subBranchId) : null,
-      resellerId: effectiveResellerId,
       // Optional fields
       middleName: middleName || null,
-      secondaryContactNumber: secondaryContactNumber || null,
+      secondaryContactNumber: secondaryContactNumber ? secondaryContactNumber.trim() : null,
       memberShipId: memberShipId ? Number(memberShipId) : null,
       notes: notes || null,
       assignedUserId: assignedUserId ? Number(assignedUserId) : null,
@@ -84,6 +75,8 @@ async function createLead(req, res, next) {
       province: province || null,
       gender: gender || null,
       metadata: {
+        city: city ? city.trim() : null,
+        zipCode: zipCode ? zipCode.trim() : null,
         age: age || null,
         fullAddress: fullAddress || null,
         latitude: latitude || null,
@@ -92,14 +85,29 @@ async function createLead(req, res, next) {
       }
     };
 
+    // Fetch duplicate settings
+    const dupSettings = await req.prisma.iSPSettings.findMany({
+      where: {
+        ispId: req.ispId ? Number(req.ispId) : undefined,
+        key: { in: ['allowDuplicateLeadPhone', 'allowDuplicateLeadEmail'] }
+      }
+    });
+    const allowDupPhone = dupSettings.find(s => s.key === 'allowDuplicateLeadPhone')?.value === 'true';
+    const allowDupEmail = dupSettings.find(s => s.key === 'allowDuplicateLeadEmail')?.value === 'true';
+
     // Check for existing lead with same email or phone number
-    if (email || phoneNumber) {
+    const dupConditions = [];
+    if (email && email.trim() && !allowDupEmail) {
+      dupConditions.push({ email: email.trim() });
+    }
+    if (phoneNumber && phoneNumber.trim() && !allowDupPhone) {
+      dupConditions.push({ phoneNumber: phoneNumber.trim() });
+    }
+
+    if (dupConditions.length > 0) {
       const existingLead = await req.prisma.lead.findFirst({
         where: {
-          OR: [
-            email ? { email } : {},
-            phoneNumber ? { phoneNumber } : {}
-          ],
+          OR: dupConditions,
           ispId: req.ispId ? Number(req.ispId) : null,
           isDeleted: false
         }
@@ -164,7 +172,6 @@ const getAllLeads = async (req, res, next) => {
     const where = {
       isDeleted: false,
       ispId: req.ispId || req.user.ispId,
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
     };
 
     // ROLE-BASED FILTERING (EXACTLY LIKE FOLLOW-UPS)
@@ -365,8 +372,7 @@ async function getLeadById(req, res, next) {
       where: {
         id: id,
         ispId: req.ispId,
-        isDeleted: false,
-        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+        isDeleted: false
       },
       include: {
         membership: true,
@@ -407,7 +413,8 @@ async function getLeadById(req, res, next) {
             id: true,
             customerUniqueId: true,
             idNumber: true,
-            status: true
+            status: true,
+            isDeleted: true
           }
         }
       }
@@ -415,6 +422,20 @@ async function getLeadById(req, res, next) {
 
     if (!lead) {
       return res.status(404).json({ error: "Lead not found." });
+    }
+
+    // If customer was deleted (or no active customer exists), ensure lead is reverted to qualified so it can be re-onboarded
+    const hasActiveCustomer = lead.customers?.some(c => !c.isDeleted && c.status !== 'deleted');
+    if (!hasActiveCustomer && (lead.convertedToCustomer || lead.status === 'converted')) {
+      await req.prisma.lead.update({
+        where: { id: lead.id },
+        data: {
+          convertedToCustomer: false,
+          status: 'qualified'
+        }
+      });
+      lead.convertedToCustomer = false;
+      lead.status = 'qualified';
     }
 
     // Fetch SMS logs sent to this lead. Manual uploads can be logged as
@@ -498,6 +519,8 @@ async function updateLead(req, res, next) {
       street,
       district,
       province,
+      city,
+      zipCode,
       gender,
       age,
       fullAddress,
@@ -510,8 +533,7 @@ async function updateLead(req, res, next) {
       where: {
         id: id,
         ispId: req.ispId,
-        isDeleted: false,
-        ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+        isDeleted: false
       }
     });
 
@@ -519,14 +541,29 @@ async function updateLead(req, res, next) {
       return res.status(404).json({ error: "Lead not found." });
     }
 
+    // Fetch duplicate settings
+    const dupSettings = await req.prisma.iSPSettings.findMany({
+      where: {
+        ispId: req.ispId ? Number(req.ispId) : undefined,
+        key: { in: ['allowDuplicateLeadPhone', 'allowDuplicateLeadEmail'] }
+      }
+    });
+    const allowDupPhone = dupSettings.find(s => s.key === 'allowDuplicateLeadPhone')?.value === 'true';
+    const allowDupEmail = dupSettings.find(s => s.key === 'allowDuplicateLeadEmail')?.value === 'true';
+
     // Check for duplicate email/phone when updating
-    if (email || phoneNumber) {
+    const dupConditions = [];
+    if (email && email.trim() && !allowDupEmail) {
+      dupConditions.push({ email: email.trim() });
+    }
+    if (phoneNumber && phoneNumber.trim() && !allowDupPhone) {
+      dupConditions.push({ phoneNumber: phoneNumber.trim() });
+    }
+
+    if (dupConditions.length > 0) {
       const duplicateLead = await req.prisma.lead.findFirst({
         where: {
-          OR: [
-            email ? { email } : {},
-            phoneNumber ? { phoneNumber } : {}
-          ],
+          OR: dupConditions,
           NOT: { id: id },
           ispId: req.ispId,
           isDeleted: false
@@ -561,9 +598,9 @@ async function updateLead(req, res, next) {
     if (firstName !== undefined) updateData.firstName = firstName;
     if (middleName !== undefined) updateData.middleName = middleName;
     if (lastName !== undefined) updateData.lastName = lastName;
-    if (email !== undefined) updateData.email = email;
-    if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber;
-    if (secondaryContactNumber !== undefined) updateData.secondaryContactNumber = secondaryContactNumber;
+    if (email !== undefined) updateData.email = email && email.trim() ? email.trim() : null;
+    if (phoneNumber !== undefined) updateData.phoneNumber = (phoneNumber && phoneNumber.trim()) ? phoneNumber.trim() : null;
+    if (secondaryContactNumber !== undefined) updateData.secondaryContactNumber = (secondaryContactNumber && secondaryContactNumber.trim()) ? secondaryContactNumber.trim() : null;
     if (source !== undefined) updateData.source = source;
     if (status !== undefined) updateData.status = status;
     if (memberShipId !== undefined) updateData.memberShipId = memberShipId ? Number(memberShipId) : null;
@@ -579,6 +616,8 @@ async function updateLead(req, res, next) {
     if (gender !== undefined) updateData.gender = gender;
     updateData.metadata = {
       ...existingLead.metadata,
+      city: city !== undefined ? (city ? city.trim() : null) : existingLead.metadata?.city,
+      zipCode: zipCode !== undefined ? (zipCode ? zipCode.trim() : null) : existingLead.metadata?.zipCode,
       age: age !== undefined ? age : existingLead.metadata?.age,
       fullAddress: fullAddress !== undefined ? fullAddress : existingLead.metadata?.fullAddress,
       latitude: latitude !== undefined ? latitude : existingLead.metadata?.latitude,
@@ -602,24 +641,7 @@ async function updateLead(req, res, next) {
       }
     });
 
-    const normalizeLeadAuditRecord = (record) => {
-      const snapshot = Object.fromEntries(Object.keys(existingLead).map(key => [key, record[key]]));
-      const metadata = snapshot.metadata && typeof snapshot.metadata === 'object' ? snapshot.metadata : {};
-      snapshot.metadata = {
-        age: metadata.age ?? null,
-        fullAddress: metadata.fullAddress ?? null,
-        latitude: metadata.latitude ?? null,
-        longitude: metadata.longitude ?? null,
-        serviceRadius: metadata.serviceRadius ?? '0.1'
-      };
-      return snapshot;
-    };
-    await logAudit(req.prisma, req.user?.id, 'LEAD_UPDATE', {
-      entity: 'Lead',
-      entityId: updatedLead.id,
-      before: normalizeLeadAuditRecord(existingLead),
-      after: normalizeLeadAuditRecord(updatedLead)
-    }, req);
+    await logAudit(req.prisma, req.user?.id, 'LEAD_UPDATE', { id: updatedLead.id, firstName: updatedLead.firstName, lastName: updatedLead.lastName }, req);
 
     return res.status(200).json(updatedLead);
   } catch (err) {
@@ -700,11 +722,28 @@ async function convertLeadToCustomer(req, res, next) {
       return res.status(404).json({ error: "Lead not found." });
     }
 
-    if (lead.convertedToCustomer) {
+    // Check if an existing customer for this lead or email exists (including soft-deleted)
+    const existingCustomerForLead = await req.prisma.customer.findFirst({
+      where: {
+        OR: [
+          { leadId: leadId },
+          lead.email ? { lead: { email: lead.email } } : null
+        ].filter(Boolean),
+        ispId: req.ispId
+      }
+    });
+
+    if (existingCustomerForLead) {
+      if (!existingCustomerForLead.isDeleted) {
+        return res.status(409).json({
+          error: "Customer with this email or lead already exists."
+        });
+      }
+    } else if (lead.convertedToCustomer) {
       return res.status(400).json({ error: "Lead already converted to customer." });
     }
 
-    // Check if customer with same email already exists
+    // Check if customer with same email already exists (active)
     if (lead.email) {
       const existingCustomer = await req.prisma.customer.findFirst({
         where: {
@@ -714,7 +753,7 @@ async function convertLeadToCustomer(req, res, next) {
         }
       });
 
-      if (existingCustomer) {
+      if (existingCustomer && (!existingCustomerForLead || existingCustomer.id !== existingCustomerForLead.id)) {
         return res.status(409).json({
           error: "Customer with this email already exists."
         });
@@ -756,10 +795,27 @@ async function convertLeadToCustomer(req, res, next) {
       subBranchId: lead.subBranchId || null
     };
 
-    // Start transaction
-    const [newCustomer, updatedLead] = await req.prisma.$transaction([
-      // Create customer
-      req.prisma.customer.create({
+    let customerOperation;
+    if (existingCustomerForLead && existingCustomerForLead.isDeleted) {
+      // Reactivate from deleted to active with updated values
+      customerOperation = req.prisma.customer.update({
+        where: { id: existingCustomerForLead.id },
+        data: {
+          ...customerData,
+          isDeleted: false,
+          status: 'active',
+          onboardStatus: 'active',
+          updatedAt: new Date()
+        },
+        include: {
+          packagePrice: true,
+          subscribedPkg: true,
+          membership: true,
+          lead: true
+        }
+      });
+    } else {
+      customerOperation = req.prisma.customer.create({
         data: customerData,
         include: {
           packagePrice: true,
@@ -767,7 +823,12 @@ async function convertLeadToCustomer(req, res, next) {
           membership: true,
           lead: true
         }
-      }),
+      });
+    }
+
+    // Start transaction
+    const [newCustomer, updatedLead] = await req.prisma.$transaction([
+      customerOperation,
 
       // Update lead conversion status
       req.prisma.lead.update({
@@ -855,8 +916,7 @@ async function getConvertedLeads(req, res, next) {
     const where = {
       ispId: req.ispId || req.user.ispId,
       convertedToCustomer: true,
-      isDeleted: false,
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+      isDeleted: false
     };
 
     // Add search functionality (MySQL doesn't support mode: 'insensitive')
@@ -948,50 +1008,131 @@ async function importLeadsFromCSV(req, res, next) {
         .on('error', reject);
     });
 
+    const branchCache = new Map();
+
     for (let i = 0; i < results.length; i++) {
       const row = results[i];
       try {
-        const leadData = {
-          firstName: row.firstName || 'Unknown',
-          middleName: row.middleName || null,
-          lastName: row.lastName || 'Unknown',
-          email: row.email || `${Date.now()}_${i}@unknown.com`,
-          phoneNumber: row.phoneNumber || '0000000000',
-          secondaryContactNumber: row.secondaryContactNumber || null,
-          source: row.source || 'import',
-          status: row.status || 'new',
-          ispId: req.ispId ? Number(req.ispId) : null,
-          resellerId: req.user?.resellerId ? Number(req.user.resellerId) : null,
-          memberShipId: row.memberShipId ? Number(row.memberShipId) : null,
-          notes: row.notes || null,
-          assignedUserId: row.assignedUserId ? Number(row.assignedUserId) : null,
-          interestedPackageId: row.interestedPackageId ? Number(row.interestedPackageId) : null,
-          address: row.address || null,
-          street: row.street || null,
-          district: row.district || null,
-          province: row.province || null,
-          gender: row.gender || null,
-          metadata: {
-            age: row.age || null,
-            fullAddress: row.fullAddress || null
+        let firstName = (row.firstName || row.first_name || row['First Name'] || '').toString().trim();
+        let middleName = (row.middleName || row.middle_name || row['Middle Name'] || '').toString().trim() || null;
+        let lastName = (row.lastName || row.last_name || row['Last Name'] || '').toString().trim();
+        const fullName = (row.name || row.fullName || row['Full Name'] || row['Lead Name'] || '').toString().trim();
+
+        if (!firstName && !lastName && fullName) {
+          const parts = fullName.split(/\s+/).filter(Boolean);
+          if (parts.length === 1) {
+            firstName = parts[0];
+            lastName = 'Prospect';
+          } else if (parts.length === 2) {
+            firstName = parts[0];
+            lastName = parts[1];
+          } else if (parts.length > 2) {
+            firstName = parts[0];
+            middleName = parts.slice(1, parts.length - 1).join(' ');
+            lastName = parts[parts.length - 1];
           }
-        };
+        }
+
+        if (!firstName && !lastName) {
+          firstName = `Lead-${i + 1}`;
+          lastName = 'Prospect';
+        }
+
+        const phone = (row.phoneNumber || row.phone || row.mobile || row.contact || row['Phone Number'] || row['Mobile'] || '').toString().trim();
+        const rawEmail = (row.email || row['Email'] || row['Email Address'] || '').toString().trim().toLowerCase();
+        const cleanEmail = rawEmail || null;
+
+        if (!phone && !cleanEmail) {
+          failedCount++;
+          errors.push(`Row ${i + 2}: Skipped - missing both phone number and email.`);
+          continue;
+        }
+
+        const branchName = (row.branch || row.branchName || row['Branch Name'] || row.HeadBranch || '').toString().trim();
+        const subBranchName = (row.subBranch || row.subBranchName || row['Sub-Branch Name'] || '').toString().trim();
+        let branchId = row.branchId ? Number(row.branchId) : null;
+        let subBranchId = row.subBranchId ? Number(row.subBranchId) : null;
+
+        if (branchName && !branchId) {
+          const bKey = branchName.toLowerCase();
+          if (!branchCache.has(bKey)) {
+            const br = await req.prisma.branch.findFirst({
+              where: {
+                name: branchName,
+                parentId: null,
+                ...(req.ispId ? { ispId: Number(req.ispId) } : {}),
+                isDeleted: false
+              }
+            });
+            branchCache.set(bKey, br ? br.id : null);
+          }
+          branchId = branchCache.get(bKey);
+        }
+
+        if (subBranchName && !subBranchId) {
+          const sbKey = `${branchName}>${subBranchName}`.toLowerCase();
+          if (!branchCache.has(sbKey)) {
+            const sbr = await req.prisma.branch.findFirst({
+              where: {
+                name: subBranchName,
+                ...(branchId ? { parentId: branchId } : {}),
+                ...(req.ispId ? { ispId: Number(req.ispId) } : {}),
+                isDeleted: false
+              }
+            });
+            branchCache.set(sbKey, sbr ? sbr.id : null);
+          }
+          subBranchId = branchCache.get(sbKey);
+        }
 
         const existingLead = await req.prisma.lead.findFirst({
           where: {
-            OR: [leadData.email ? { email: leadData.email } : {}],
-            ispId: req.ispId ? Number(req.ispId) : null,
-            ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {}),
+            OR: [
+              ...(cleanEmail ? [{ email: cleanEmail }] : []),
+              ...(phone ? [{ phoneNumber: phone }] : [])
+            ],
+            ...(req.ispId ? { ispId: Number(req.ispId) } : {}),
             isDeleted: false
           }
         });
 
+        const validStatus = ['new', 'contacted', 'qualified', 'unqualified', 'converted'].includes(String(row.status || '').toLowerCase())
+          ? String(row.status).toLowerCase()
+          : 'new';
+
         if (!existingLead) {
-          await req.prisma.lead.create({ data: leadData });
+          await req.prisma.lead.create({
+            data: {
+              firstName,
+              middleName,
+              lastName,
+              email: cleanEmail,
+              phoneNumber: phone || null,
+              secondaryContactNumber: (row.secondaryContactNumber || row['Secondary Contact'] || row.altPhone || '').toString().trim() || null,
+              source: (row.source || row['Source'] || 'import').toString().trim(),
+              status: validStatus,
+              ispId: req.ispId ? Number(req.ispId) : null,
+              branchId: branchId || null,
+              subBranchId: subBranchId || null,
+              memberShipId: row.memberShipId ? Number(row.memberShipId) : null,
+              notes: (row.notes || row['Notes'] || '').toString().trim() || null,
+              assignedUserId: row.assignedUserId ? Number(row.assignedUserId) : null,
+              interestedPackageId: row.interestedPackageId ? Number(row.interestedPackageId) : null,
+              address: (row.address || row['Address'] || '').toString().trim() || null,
+              street: (row.street || row['Street'] || '').toString().trim() || null,
+              district: (row.district || row.city || row['District'] || row['City'] || '').toString().trim() || null,
+              province: (row.province || row.state || row['Province'] || row['State'] || '').toString().trim() || null,
+              gender: (row.gender || row['Gender'] || '').toString().trim() || null,
+              metadata: {
+                age: row.age || row['Age'] || null,
+                fullAddress: row.fullAddress || row['Full Address'] || null
+              }
+            }
+          });
           importedCount++;
         } else {
           failedCount++;
-          errors.push(`Row ${i + 2}: Lead already exists`);
+          errors.push(`Row ${i + 2}: Lead already exists (${cleanEmail || phone}) with ID #${existingLead.id}`);
         }
       } catch (error) {
         failedCount++;
@@ -1061,8 +1202,7 @@ async function getLeadReports(req, res) {
     // Build filter conditions
     const whereConditions = {
       ispId: req.ispId,
-      isDeleted: false,
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+      isDeleted: false
     };
 
     // Add date range filter
@@ -1184,8 +1324,7 @@ async function exportLeadReport(req, res) {
     // Build filter conditions (same as getLeadReports)
     const whereConditions = {
       ispId: req.ispId,
-      isDeleted: false,
-      ...(req.user?.resellerId ? { resellerId: Number(req.user.resellerId) } : {})
+      isDeleted: false
     };
 
     if (startDate || endDate) {

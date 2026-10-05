@@ -262,6 +262,69 @@ async function saveEsewaConfiguration(req, res, next) {
     } catch (err) { next(err); }
 }
 
+async function getExternalPaymentConfiguration(req, res, next) {
+    try {
+        const [tokenConfig, service] = await Promise.all([
+            req.prisma.externalPaymentConfiguration.findUnique({ where: { ispId: req.ispId } }),
+            req.prisma.iSPService.findFirst({
+                where: { ispId: req.ispId, service: { code: 'EXTERNAL_PAYMENT' }, isDeleted: false },
+                select: { config: true, isActive: true, isEnabled: true }
+            })
+        ]);
+        const crypto = require('crypto');
+        res.json({
+            ispId: req.ispId,
+            enabled: Boolean(tokenConfig?.isActive),
+            username: tokenConfig?.username || `ext_isp${req.ispId}_${crypto.randomBytes(3).toString('hex')}`,
+            passwordConfigured: Boolean(tokenConfig?.passwordHash),
+            apiKeyConfigured: Boolean(tokenConfig?.apiKey),
+            apiKey: tokenConfig?.apiKey || null,
+            authMethod: tokenConfig?.authMethod || 'BEARER',
+            defaultPaymentMode: tokenConfig?.defaultPaymentMode || 'EXTERNAL',
+            serviceEnabled: Boolean(service?.isActive && service?.isEnabled)
+        });
+    } catch (err) { next(err); }
+}
+
+async function saveExternalPaymentConfiguration(req, res, next) {
+    try {
+        if (!isSystemAdmin(req)) {
+            return res.status(403).json({ error: 'Only system administrators can configure External Payment.' });
+        }
+        const crypto = require('crypto');
+        const { enabled = true, username, password, apiKey, authMethod = 'BEARER', defaultPaymentMode = 'EXTERNAL' } = req.body || {};
+        const cleanUsername = String(username || `ext_isp${req.ispId}_${crypto.randomBytes(3).toString('hex')}`).trim();
+        const existing = await req.prisma.externalPaymentConfiguration.findUnique({ where: { ispId: req.ispId } });
+
+        const data = {
+            username: cleanUsername,
+            isActive: Boolean(enabled),
+            authMethod: String(authMethod || 'BEARER').toUpperCase(),
+            defaultPaymentMode: String(defaultPaymentMode || 'EXTERNAL').toUpperCase(),
+            ...(password ? { passwordHash: await bcrypt.hash(String(password), 10) } : {}),
+            ...(apiKey !== undefined ? { apiKey: String(apiKey || '') } : {})
+        };
+
+        if (existing) {
+            await req.prisma.externalPaymentConfiguration.update({ where: { ispId: req.ispId }, data });
+        } else {
+            if (!password) {
+                data.passwordHash = await bcrypt.hash(`Ext#ISP${req.ispId}!${crypto.randomBytes(4).toString('hex')}`, 10);
+            }
+            await req.prisma.externalPaymentConfiguration.create({ data: { ispId: req.ispId, ...data } });
+        }
+
+        res.json({
+            success: true,
+            ispId: req.ispId,
+            enabled: Boolean(enabled),
+            username: cleanUsername,
+            authMethod: data.authMethod,
+            defaultPaymentMode: data.defaultPaymentMode
+        });
+    } catch (err) { next(err); }
+}
+
 const RADIUS_POOLS_KEY = (ispId) => `isp:${ispId}:radiusPools`;
 
 function normalizePool(input) {
@@ -477,6 +540,8 @@ module.exports = {
     generateEsewaBase64,
     getEsewaConfiguration,
     saveEsewaConfiguration,
+    getExternalPaymentConfiguration,
+    saveExternalPaymentConfiguration,
     listRadiusPools,
     upsertRadiusPool,
     deleteRadiusPool,

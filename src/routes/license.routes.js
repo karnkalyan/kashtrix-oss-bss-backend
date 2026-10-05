@@ -1,20 +1,9 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const isAuthenticated = require('../middlewares/isAuthenticated');
-const {
-  getHardwareFingerprint,
-  getStatus,
-  generateLicense,
-  getGeneratedLicenseToken,
-  listGeneratedLicenses,
-  updateGeneratedLicenseStatus,
-  saveToken,
-  deleteToken
-} = require('../services/license.service');
+const { secureLicense } = require('../services/license.service');
 
 const ACCESS_SECRET = process.env.ACCESS_SECRET;
-const LICENSE_GENERATOR_SECRET = process.env.LICENSE_GENERATOR_SECRET || process.env.ACCESS_SECRET;
-const GENERATOR_ACCESS_COOKIE = 'license_generator_access';
 
 function isSystemAdmin(req) {
   const role = String(req.user?.role || '').toLowerCase();
@@ -25,24 +14,13 @@ module.exports = (prisma) => {
   const router = express.Router();
   const auth = isAuthenticated(prisma);
 
-  function signGeneratorAccess(userId) {
-    return jwt.sign({ userId, scope: 'license_generator' }, ACCESS_SECRET, { expiresIn: '30m' });
-  }
-
-  function hasGeneratorAccess(req) {
-    const token = req.cookies?.[GENERATOR_ACCESS_COOKIE];
-    if (!token || !ACCESS_SECRET) return false;
-    try {
-      const payload = jwt.verify(token, ACCESS_SECRET);
-      return payload?.scope === 'license_generator' && payload?.userId === req.user?.id;
-    } catch {
-      return false;
-    }
-  }
-
   async function getRequestIsp(req) {
     if (!ACCESS_SECRET) return null;
-    const token = req.cookies?.access_token || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
+    const token =
+      req.cookies?.access_token ||
+      (req.headers.authorization?.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7).trim()
+        : null);
     if (!token) return null;
 
     try {
@@ -61,10 +39,10 @@ module.exports = (prisma) => {
               city: true,
               state: true,
               country: true,
-              website: true
-            }
-          }
-        }
+              website: true,
+            },
+          },
+        },
       });
       return user?.isp || null;
     } catch {
@@ -72,139 +50,140 @@ module.exports = (prisma) => {
     }
   }
 
-  async function getPublicIsp(status) {
-    const installedIspId = status?.dbLicense?.installedIspId || Number(process.env.DEFAULT_ISP_ID || 1);
-    const normalizedIspId = Number(installedIspId);
-    const isp = Number.isFinite(normalizedIspId) && normalizedIspId > 0
-      ? await prisma.iSP.findUnique({
-          where: { id: normalizedIspId },
-          select: { companyName: true }
-        })
-      : null;
-
-    if (isp) return isp;
-
-    return prisma.iSP.findFirst({
-      orderBy: { id: 'asc' },
-      select: { companyName: true }
-    });
+  async function getPublicIsp() {
+    try {
+      return await prisma.iSP.findFirst({
+        orderBy: { id: 'asc' },
+        select: {
+          id: true,
+          companyName: true,
+          contactPerson: true,
+          phoneNumber: true,
+          masterEmail: true,
+          address: true,
+          city: true,
+          state: true,
+          country: true,
+          website: true,
+        },
+      });
+    } catch {
+      return null;
+    }
   }
 
+  // License status check
   router.get('/status', async (req, res, next) => {
     try {
+      const status = secureLicense.getPublicStatus();
       const isp = await getRequestIsp(req);
-      const ispId = isp?.id || Number(process.env.DEFAULT_ISP_ID || 1);
-      const status = await getStatus(prisma, ispId);
-      const publicIsp = isp || await getPublicIsp(status);
-      res.json({ ...status, isp, publicIsp });
+      const publicIsp = isp || (await getPublicIsp());
+      res.json({
+        ...status,
+        isp,
+        publicIsp,
+      });
     } catch (error) {
       next(error);
     }
   });
 
-  router.get('/hwid', auth, async (req, res) => {
-    const requestedIspId = Number(req.query?.ispId || req.ispId);
-    if (requestedIspId !== req.ispId && !isSystemAdmin(req)) return res.status(403).json({ error: 'Provider access is restricted.' });
-    const tenant = await prisma.iSP.findUnique({ where: { id: requestedIspId }, select: { id: true } });
-    if (!tenant) return res.status(404).json({ error: 'ISP tenant not found.' });
-    res.json({ hwid: await getHardwareFingerprint(prisma, requestedIspId), ispId: requestedIspId });
-  });
-
-  router.post('/install', auth, async (req, res, next) => {
+  // Hardware ID & Provisioning endpoint
+  router.get('/hwid', async (req, res, next) => {
     try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can install license.' });
-      const token = String(req.body?.token || '').trim();
-      if (!token) return res.status(400).json({ error: 'License token is required' });
-      await saveToken(prisma, req.ispId, token);
-      res.json(await getStatus(prisma, req.ispId));
+      const [hardwareId, clientId] = await Promise.all([
+        secureLicense.getHardwareId(),
+        secureLicense.getClientId(),
+      ]);
+      const provisioningId = secureLicense.getProvisioningId();
+      res.json({
+        hwid: hardwareId,
+        hardwareId,
+        clientId,
+        provisioningId,
+        tenantId: secureLicense.config.tenantId,
+        applicationId: secureLicense.config.applicationId,
+      });
     } catch (error) {
       next(error);
     }
   });
 
+  // Provisioning details endpoint
+  router.get('/provisioning', async (req, res, next) => {
+    try {
+      const [hardwareId, clientId] = await Promise.all([
+        secureLicense.getHardwareId(),
+        secureLicense.getClientId(),
+      ]);
+      res.json({
+        provisioningId: secureLicense.getProvisioningId(),
+        hwid: hardwareId,
+        clientId,
+        tenantId: secureLicense.config.tenantId,
+        applicationId: secureLicense.config.applicationId,
+        modules: secureLicense.supportedModules,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Install / Activate license
+  const handleActivation = async (req, res, next) => {
+    try {
+      if (req.user && !isSystemAdmin(req)) {
+        return res.status(403).json({ error: 'Only administrators can activate license.' });
+      }
+      const token = String(req.body?.token || req.body?.licenseKey || '').trim();
+      if (!token) {
+        return res.status(400).json({ error: 'License key or JWT token is required' });
+      }
+      const status = await secureLicense.activate(token);
+      res.json(status);
+    } catch (error) {
+      res.status(400).json({
+        error: error.message || 'Failed to activate license',
+        status: secureLicense.getPublicStatus(),
+      });
+    }
+  };
+
+  router.post('/activate', auth, handleActivation);
+  router.post('/install', auth, handleActivation);
+
+  // Deactivate license
   router.delete('/', auth, async (req, res, next) => {
     try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can delete license.' });
-      await deleteToken(prisma, req.ispId);
-      res.json(await getStatus(prisma, req.ispId));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.post('/generate', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can generate license.' });
-      if (!hasGeneratorAccess(req)) return res.status(403).json({ error: 'License generator access has expired. Please enter the access secret again.' });
-      res.json(await generateLicense(prisma, { ...(req.body || {}), ispId: req.body?.ispId || req.ispId }, req.user));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.post('/generator-access', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can access license generator.' });
-      if (!LICENSE_GENERATOR_SECRET) return res.status(500).json({ error: 'LICENSE_GENERATOR_SECRET is not configured.' });
-
-      const accessSecret = String(req.body?.accessSecret || '');
-      if (!accessSecret || accessSecret !== LICENSE_GENERATOR_SECRET) {
-        return res.status(403).json({ error: 'Invalid license generator access secret.' });
+      if (!isSystemAdmin(req)) {
+        return res.status(403).json({ error: 'Only administrators can delete license.' });
       }
-
-      res.cookie(GENERATOR_ACCESS_COOKIE, signGeneratorAccess(req.user.id), {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'Lax',
-        path: '/',
-        maxAge: 1000 * 60 * 30
-      });
-
-      res.json({ success: true });
+      const status = await secureLicense.deactivate();
+      res.json(status);
     } catch (error) {
       next(error);
     }
   });
 
-  router.get('/generated', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can view generated licenses.' });
-      res.json({ licenses: await listGeneratedLicenses(prisma) });
-    } catch (error) {
-      next(error);
-    }
+  // Legacy license generator endpoints - notify migration to centralized license manager
+  router.post('/generator-access', auth, (req, res) => {
+    res.status(410).json({
+      error: 'License generation is now managed through the Centralized Secure License Server (https://license.simulcast.com.np).',
+      provisioningUrl: 'https://license.simulcast.com.np',
+      provisioningId: secureLicense.getProvisioningId(),
+      hwid: secureLicense.hwid,
+    });
   });
 
-  router.get('/generated/:id/token', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can view generated license keys.' });
-      if (!hasGeneratorAccess(req)) return res.status(403).json({ error: 'License generator access has expired. Please enter the access secret again.' });
-      res.json(await getGeneratedLicenseToken(prisma, req.params.id));
-    } catch (error) {
-      next(error);
-    }
+  router.post('/generate', auth, (req, res) => {
+    res.status(410).json({
+      error: 'License generation has migrated to the Centralized Secure License Server (https://license.simulcast.com.np).',
+      provisioningUrl: 'https://license.simulcast.com.np',
+    });
   });
 
-  router.post('/generated/:id/install', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can install generated licenses.' });
-      if (!hasGeneratorAccess(req)) return res.status(403).json({ error: 'License generator access has expired. Please enter the access secret again.' });
-      const { token } = await getGeneratedLicenseToken(prisma, req.params.id);
-      await saveToken(prisma, req.ispId, token);
-      res.json(await getStatus(prisma, req.ispId));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.patch('/generated/:id/status', auth, async (req, res, next) => {
-    try {
-      if (!isSystemAdmin(req)) return res.status(403).json({ error: 'Only administrators can update license status.' });
-      const license = await updateGeneratedLicenseStatus(prisma, req.params.id, req.body || {}, req.user);
-      res.json({ license });
-    } catch (error) {
-      next(error);
-    }
+  router.get('/generated', auth, (req, res) => {
+    res.json({ licenses: [] });
   });
 
   return router;

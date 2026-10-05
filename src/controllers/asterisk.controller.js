@@ -77,10 +77,6 @@ class AsteriskController {
     try {
       const ispId = req.ispId;
       const service = await AsteriskService.create(ispId, this.prisma);
-      const result = await service.syncSystemStatus();
-      if (!result.success) {
-        return res.status(502).json(result);
-      }
       res.json(result);
     } catch (error) {
       res.status(500).json(this.#handleServiceError(error, 'sync_system_status'));
@@ -292,12 +288,15 @@ class AsteriskController {
       const ispId = req.ispId;
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.listExtensions();
-      if (!result.success) {
-        return res.status(502).json(result);
-      }
       res.json(result);
     } catch (error) {
-      res.status(500).json(this.#handleServiceError(error, 'list_extensions'));
+      res.json({
+        success: true,
+        connected: false,
+        data: [],
+        total: 0,
+        message: 'Asterisk service not configured or connected'
+      });
     }
   }
 
@@ -557,10 +556,10 @@ class AsteriskController {
         }
       });
     } catch (error) {
-      if (error.code === 'PROVISIONING_NOT_CONFIGURED') {
-        return res.status(503).json({ success: false, code: error.code, message: error.message });
+      if (error.code === 'PROVISIONING_NOT_CONFIGURED' || error.message?.includes('not configured')) {
+        return res.status(400).json({ success: false, connected: false, code: error.code || 'SERVICE_DISCONNECTED', message: 'Asterisk provisioning is not configured. Please configure in Service Integrations.' });
       }
-      res.status(500).json(this.#handleServiceError(error, 'restart_ai_agent'));
+      res.status(400).json(this.#handleServiceError(error, 'restart_ai_agent'));
     }
   }
 
@@ -589,10 +588,10 @@ class AsteriskController {
         }
       });
     } catch (error) {
-      if (error.code === 'PROVISIONING_NOT_CONFIGURED') {
-        return res.status(503).json({ success: false, code: error.code, message: error.message });
+      if (error.code === 'PROVISIONING_NOT_CONFIGURED' || error.message?.includes('not configured')) {
+        return res.status(400).json({ success: false, connected: false, code: error.code || 'SERVICE_DISCONNECTED', message: 'Asterisk provisioning is not configured. Please configure in Service Integrations.' });
       }
-      res.status(500).json(this.#handleServiceError(error, 'start_ai_agent'));
+      res.status(400).json(this.#handleServiceError(error, 'start_ai_agent'));
     }
   }
 
@@ -621,10 +620,10 @@ class AsteriskController {
         }
       });
     } catch (error) {
-      if (error.code === 'PROVISIONING_NOT_CONFIGURED') {
-        return res.status(503).json({ success: false, code: error.code, message: error.message });
+      if (error.code === 'PROVISIONING_NOT_CONFIGURED' || error.message?.includes('not configured')) {
+        return res.status(400).json({ success: false, connected: false, code: error.code || 'SERVICE_DISCONNECTED', message: 'Asterisk provisioning is not configured. Please configure in Service Integrations.' });
       }
-      res.status(500).json(this.#handleServiceError(error, 'stop_ai_agent'));
+      res.status(400).json(this.#handleServiceError(error, 'stop_ai_agent'));
     }
   }
 
@@ -656,7 +655,7 @@ class AsteriskController {
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.makeCall(sourceExtension, agent.extension);
       if (!result.success) {
-        return res.status(502).json(result);
+        return res.status(400).json(result);
       }
       res.json(result);
     } catch (error) {
@@ -670,12 +669,15 @@ class AsteriskController {
       const ispId = req.ispId;
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.listTrunks();
-      if (!result.success) {
-        return res.status(502).json(result);
-      }
       res.json(result);
     } catch (error) {
-      res.status(500).json(this.#handleServiceError(error, 'list_trunks'));
+      res.json({
+        success: true,
+        connected: false,
+        data: [],
+        total: 0,
+        message: 'Asterisk service not configured or connected'
+      });
     }
   }
 
@@ -943,7 +945,7 @@ class AsteriskController {
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.makeCall(extension, number);
       if (!result.success) {
-        return res.status(502).json(result);
+        return res.status(400).json(result);
       }
       res.json(result);
     } catch (error) {
@@ -971,7 +973,7 @@ class AsteriskController {
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.hangupCall(channelid);
       if (!result.success) {
-        return res.status(502).json(result);
+        return res.status(400).json(result);
       }
       res.json(result);
     } catch (error) {
@@ -1045,12 +1047,15 @@ class AsteriskController {
       const ispId = req.ispId;
       const service = await AsteriskService.create(ispId, this.prisma);
       const result = await service.getActiveCalls();
-      if (!result.success) {
-        return res.status(502).json(result);
-      }
       res.json(result);
     } catch (error) {
-      res.status(500).json(this.#handleServiceError(error, 'get_active_calls'));
+      res.json({
+        success: true,
+        connected: false,
+        data: [],
+        total: 0,
+        message: 'Asterisk service not configured or connected'
+      });
     }
   }
 

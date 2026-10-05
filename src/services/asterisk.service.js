@@ -95,22 +95,30 @@ class AsteriskService {
     this.#prisma = prisma;
     this.#ispId = config.ispId;
 
-    const normalizedUrl = normalizeAriUrl(config.ariHost, config.ariPort);
+    if (config && config.enabled && config.ariHost) {
+      try {
+        const normalizedUrl = normalizeAriUrl(config.ariHost, config.ariPort || 8088);
+        this.#ariClient = axios.create({
+          baseURL: normalizedUrl,
+          auth: config.ariUsername ? {
+            username: config.ariUsername,
+            password: config.ariPassword || ''
+          } : undefined,
+          timeout: 4000,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        });
 
-    this.#ariClient = axios.create({
-      baseURL: normalizedUrl,
-      auth: {
-        username: config.ariUsername,
-        password: config.ariPassword
-      },
-      timeout: 5000,
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        if (config.amiEnabled) {
+          getAmiClient(this.#ispId, this.#config);
+        }
+      } catch (err) {
+        console.warn('[ASTERISK] ARI URL initialization failed:', err.message);
+        this.#ariClient = null;
       }
-    });
-
-    getAmiClient(this.#ispId, this.#config);
+    }
   }
 
   static async create(ispId, prisma) {
@@ -132,10 +140,11 @@ class AsteriskService {
         });
       }
 
-      // Legacy fallback
+      // Check iSPService for active status
+      let ispService = null;
       let legacyConfig = {};
-      if (!config && prisma && prisma.iSPService) {
-        const ispService = await prisma.iSPService.findFirst({
+      if (prisma && prisma.iSPService) {
+        ispService = await prisma.iSPService.findFirst({
           where: { ispId, service: { code: 'ASTERISK' } },
           include: { service: true }
         });
@@ -146,15 +155,15 @@ class AsteriskService {
           }
           const hasAmi = !!(creds.ami_host && creds.ami_username);
           legacyConfig = {
-            enabled: true,
-            pbxHost: creds.ari_host || '10.3.2.16',
-            sipPort: 5060,
-            ariEnabled: true,
-            ariHost: creds.ari_host || '10.3.2.16',
+            enabled: ispService.status !== 'DISABLED' && ispService.isActive !== false,
+            pbxHost: creds.ari_host || creds.pbx_host || null,
+            sipPort: parseInt(creds.sip_port || '5060', 10),
+            ariEnabled: Boolean(creds.ari_host && creds.ari_username),
+            ariHost: creds.ari_host || null,
             ariPort: parseInt(creds.ari_port || '8088', 10),
-            ariAppName: creds.ari_app || 'kisan',
-            ariUsername: creds.ari_username || 'kashtrix-api',
-            ariPassword: creds.ari_password,
+            ariAppName: creds.ari_app || 'kashtrix-voip',
+            ariUsername: creds.ari_username || null,
+            ariPassword: creds.ari_password || null,
             amiEnabled: hasAmi,
             amiHost: hasAmi ? creds.ami_host : null,
             amiPort: hasAmi ? parseInt(creds.ami_port || '5038', 10) : null,
@@ -167,11 +176,30 @@ class AsteriskService {
         }
       }
 
-      const base = config || legacyConfig || {};
+      const hasConfig = Boolean(config && (config.ariHost || config.pbxHost));
+      const hasLegacy = Boolean(legacyConfig && legacyConfig.ariHost);
+      const hasEnv = Boolean(process.env.ASTERISK_HOST || process.env.ASTERISK_ARI_HOST);
+      const isConfigured = hasConfig || hasLegacy || hasEnv;
 
-      // Environment Overrides
-      const ariPass = process.env.ASTERISK_ARI_PASSWORD || process.env.KASHTRIX_ARI_PASSWORD || base.ariPassword;
-      const amiPass = process.env.ASTERISK_AMI_SECRET || process.env.KASHTRIX_AMI_SECRET || base.amiPassword || base.amiSecret;
+      const base = config || (hasLegacy ? legacyConfig : {});
+
+      // Determine enabled state cleanly
+      let isEnabled = false;
+      if (process.env.ASTERISK_ENABLED !== undefined) {
+        isEnabled = process.env.ASTERISK_ENABLED === 'true';
+      } else if (config) {
+        isEnabled = config.enabled !== false && Boolean(config.ariHost || config.pbxHost);
+      } else if (ispService) {
+        isEnabled = ispService.status !== 'DISABLED' && ispService.isActive !== false && isConfigured;
+      } else {
+        isEnabled = false;
+      }
+
+      // Read configuration without hardcoded LAN values
+      const ariHost = process.env.ASTERISK_ARI_HOST || base.ariHost || process.env.ASTERISK_HOST || base.pbxHost || null;
+      const ariPass = process.env.ASTERISK_ARI_PASSWORD || process.env.KASHTRIX_ARI_PASSWORD || base.ariPassword || null;
+      const ariUser = process.env.ASTERISK_ARI_USERNAME || base.ariUsername || null;
+      const amiPass = process.env.ASTERISK_AMI_SECRET || process.env.KASHTRIX_AMI_SECRET || base.amiPassword || base.amiSecret || null;
       const amiHost = process.env.ASTERISK_AMI_HOST || base.amiHost || null;
       const amiUsername = process.env.ASTERISK_AMI_USERNAME || base.amiUsername || null;
       const amiPort = process.env.ASTERISK_AMI_PORT
@@ -179,33 +207,34 @@ class AsteriskService {
         : (amiHost ? (base.amiPort || 5038) : null);
       const amiRequested = process.env.ASTERISK_AMI_ENABLED !== undefined
         ? process.env.ASTERISK_AMI_ENABLED === 'true'
-        : (base.amiEnabled !== undefined ? base.amiEnabled : true);
+        : (base.amiEnabled !== undefined ? base.amiEnabled : false);
       const amiConfigured = Boolean(amiRequested && amiHost && amiUsername && amiPass);
-      const sshKey = process.env.KASHTRIX_ASTERISK_SSH_KEY_PATH || base.sshPrivateKey;
+      const sshKey = process.env.KASHTRIX_ASTERISK_SSH_KEY_PATH || base.sshPrivateKey || null;
 
       const merged = {
         ispId,
-        enabled: process.env.ASTERISK_ENABLED !== undefined ? process.env.ASTERISK_ENABLED === 'true' : (base.enabled !== undefined ? base.enabled : true),
-        pbxHost: process.env.ASTERISK_HOST || base.pbxHost || '10.3.2.16',
+        isConfigured: Boolean(isConfigured && ariHost && ariUser),
+        enabled: Boolean(isEnabled && isConfigured && ariHost && ariUser),
+        pbxHost: ariHost,
         sipPort: process.env.ASTERISK_SIP_PORT ? parseInt(process.env.ASTERISK_SIP_PORT, 10) : (base.sipPort || 5060),
-        ariEnabled: process.env.ASTERISK_ARI_ENABLED !== undefined ? process.env.ASTERISK_ARI_ENABLED === 'true' : (base.ariEnabled !== undefined ? base.ariEnabled : true),
-        ariHost: process.env.ASTERISK_ARI_HOST || base.ariHost || '10.3.2.16',
+        ariEnabled: Boolean(isEnabled && ariHost && ariUser),
+        ariHost: ariHost,
         ariPort: process.env.ASTERISK_ARI_PORT ? parseInt(process.env.ASTERISK_ARI_PORT, 10) : (base.ariPort || 8088),
-        ariAppName: process.env.ASTERISK_ARI_APP_NAME || base.ariAppName || 'kisan',
-        ariUsername: process.env.ASTERISK_ARI_USERNAME || base.ariUsername || 'kashtrix-api',
+        ariAppName: process.env.ASTERISK_ARI_APP_NAME || base.ariAppName || 'kashtrix-voip',
+        ariUsername: ariUser,
         ariPassword: ariPass,
         amiEnabled: amiConfigured,
         amiHost: amiConfigured ? amiHost : null,
         amiPort: amiConfigured ? amiPort : null,
         amiUsername: amiConfigured ? amiUsername : null,
         amiPassword: amiConfigured ? amiPass : null,
-        provisioningEnabled: process.env.ASTERISK_PROVISIONING_ENABLED !== undefined ? process.env.ASTERISK_PROVISIONING_ENABLED === 'true' : (base.provisioningEnabled !== undefined ? base.provisioningEnabled : true),
+        provisioningEnabled: Boolean(isEnabled && (process.env.ASTERISK_PROVISIONING_ENABLED !== undefined ? process.env.ASTERISK_PROVISIONING_ENABLED === 'true' : (base.provisioningEnabled !== undefined ? base.provisioningEnabled : false))),
         provisioningMode: process.env.ASTERISK_PROVISIONING_MODE || base.provisioningMode || base.mode || 'local',
-        provisioningHost: process.env.ASTERISK_HOST || base.provisioningHost || base.host || '10.3.2.16',
+        provisioningHost: process.env.ASTERISK_HOST || base.provisioningHost || base.host || null,
         provisioningPort: base.provisioningPort || base.port || 22,
-        provisioningUsername: base.provisioningUsername || base.username || 'kashtrix-api',
+        provisioningUsername: base.provisioningUsername || base.username || null,
         sshPrivateKey: sshKey,
-        sshPassword: base.sshPassword || base.sshPassword,
+        sshPassword: base.sshPassword || null,
         asteriskConfigDirectory: process.env.ASTERISK_CONFIG_DIR || base.asteriskConfigDirectory || '/etc/asterisk',
         asteriskCliPath: process.env.ASTERISK_CLI_PATH || base.asteriskCliPath || '/usr/sbin/asterisk',
         asteriskSystemdService: process.env.ASTERISK_SYSTEMD_SERVICE || base.asteriskSystemdService || 'asterisk',
@@ -249,9 +278,10 @@ class AsteriskService {
 
       return {
         service: 'asterisk',
-        enabled: config.enabled,
-        configured: true,
+        enabled: Boolean(config.enabled),
+        configured: Boolean(config.isConfigured),
         isActive: apiConnected,
+        connected: apiConnected,
         amiHost: config.amiHost,
         amiPort: config.amiPort,
         ariHost: config.ariHost,
@@ -293,6 +323,18 @@ class AsteriskService {
   }
 
   async testConnection() {
+    if (!this.#config.enabled || !this.#config.isConfigured || !this.#ariClient) {
+      return {
+        success: true,
+        connected: false,
+        isConfigured: Boolean(this.#config && this.#config.isConfigured),
+        ariConnected: false,
+        amiConnected: false,
+        message: 'Asterisk VoIP service is disabled or not configured',
+        timestamp: new Date().toISOString()
+      };
+    }
+
     let ariConnected = false;
     let ariMsg = 'ARI not tested';
 
@@ -321,6 +363,14 @@ class AsteriskService {
   }
 
   async getCapabilities() {
+    if (!this.#config.enabled || !this.#ariClient) {
+      return {
+        ari: { configured: false, connected: false, features: [] },
+        ami: { configured: false, connected: false, features: [] },
+        provisioning: { mode: 'disabled', configured: false }
+      };
+    }
+
     const AsteriskProvisioningService = require('./asterisk-provisioning.service');
     const provService = await AsteriskProvisioningService.getService(this.#ispId, this.#prisma);
     const provCapabilities = await provService.getCapabilities();
@@ -370,6 +420,26 @@ class AsteriskService {
   }
 
   async getSystemInfo() {
+    if (!this.#config.enabled || !this.#ariClient) {
+      return {
+        asteriskVersion: 'Not connected',
+        operatingSystem: 'Unknown',
+        startupTime: null,
+        lastReloadTime: null,
+        calculatedUptime: 'Offline',
+        ariConnected: false,
+        amiConnected: false,
+        activeChannelCount: 0,
+        endpointCount: 0,
+        registeredEndpointCount: 0,
+        bridgeCount: 0,
+        recordingCapability: false,
+        provisioningMode: 'disabled',
+        lastSuccessfulSync: null,
+        lastError: 'Asterisk service is disabled or not configured'
+      };
+    }
+
     let ariConnected = false;
     let version = 'Asterisk Unknown';
     let os = 'Unknown';
@@ -451,6 +521,17 @@ class AsteriskService {
 
   // ==================== EXTENSIONS ====================
   async listExtensions() {
+    if (!this.#config.enabled || !this.#ariClient) {
+      return {
+        success: true,
+        connected: false,
+        isConfigured: false,
+        data: [],
+        total: 0,
+        message: 'Asterisk service is disabled or not configured'
+      };
+    }
+
     try {
       const response = await this.#ariClient.get('/ari/endpoints');
       if (!Array.isArray(response.data)) {
@@ -481,17 +562,20 @@ class AsteriskService {
 
       return {
         success: true,
+        connected: true,
         data: extList,
         total: extList.length,
         message: 'Extensions list loaded'
       };
     } catch (error) {
       return {
-        success: false,
+        success: true,
+        connected: false,
+        isConfigured: true,
         data: [],
         total: 0,
         error: this.#extractError(error),
-        message: 'Failed to list extensions'
+        message: 'Failed to list extensions: ' + this.#extractError(error)
       };
     }
   }
@@ -629,7 +713,7 @@ class AsteriskService {
             trunkname: matchedDb ? matchedDb.trunkname : resource,
             trunktype: ep.technology || 'PJSIP',
             status,
-            host: matchedDb ? matchedDb.host : '10.3.2.50',
+            host: matchedDb ? matchedDb.host : (this.#config.pbxHost || null),
             registrationDirection: 'both',
             contacts,
             latency,
@@ -644,17 +728,20 @@ class AsteriskService {
 
       return {
         success: true,
+        connected: true,
         data: trunkList,
         total: trunkList.length,
         message: 'Trunks list loaded'
       };
     } catch (error) {
       return {
-        success: false,
+        success: true,
+        connected: false,
+        isConfigured: true,
         data: [],
         total: 0,
         error: this.#extractError(error),
-        message: 'Failed to list trunks'
+        message: 'Failed to list trunks: ' + this.#extractError(error)
       };
     }
   }
@@ -912,6 +999,17 @@ class AsteriskService {
   }
 
   async getActiveCalls() {
+    if (!this.#config.enabled || !this.#ariClient) {
+      return {
+        success: true,
+        connected: false,
+        isConfigured: false,
+        data: [],
+        total: 0,
+        message: 'Asterisk service is disabled or not configured'
+      };
+    }
+
     try {
       const response = await this.#ariClient.get('/ari/channels');
       if (!Array.isArray(response.data)) {
@@ -985,13 +1083,16 @@ class AsteriskService {
 
       return {
         success: true,
+        connected: true,
         data: channels,
         total: channels.length,
         message: 'Active calls fetched'
       };
     } catch (error) {
       return {
-        success: false,
+        success: true,
+        connected: false,
+        isConfigured: true,
         data: [],
         total: 0,
         error: this.#extractError(error),

@@ -174,8 +174,7 @@ module.exports = (prisma) => {
   // Legacy license generator endpoints - notify migration to centralized license manager
   router.post('/generator-access', auth, (req, res) => {
     res.status(410).json({
-      error: 'License generation is now managed through the Centralized Secure License Server (https://license.simulcast.com.np).',
-      provisioningUrl: 'https://license.simulcast.com.np',
+      error: 'License generation is now managed through the Centralized Secure License Server.',
       provisioningId: secureLicense.getProvisioningId(),
       hwid: secureLicense.hwid,
     });
@@ -183,8 +182,7 @@ module.exports = (prisma) => {
 
   router.post('/generate', auth, (req, res) => {
     res.status(410).json({
-      error: 'License generation has migrated to the Centralized Secure License Server (https://license.simulcast.com.np).',
-      provisioningUrl: 'https://license.simulcast.com.np',
+      error: 'License generation has migrated to the Centralized Secure License Server.',
     });
   });
 

@@ -1,7 +1,8 @@
 const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
-const { createHash } = require('crypto');
+const os = require('os');
+const { createHash, randomUUID } = require('crypto');
 const {
   MODULES,
   getEntitlementLimit,
@@ -220,12 +221,27 @@ class SecureLicenseRuntime extends EventEmitter {
 
   async getClientId() {
     if (!this.clientId) {
-      const { loadOrCreateScopedClientId } = await this.loadSdk();
-      this.clientId = await loadOrCreateScopedClientId(
-        this.storageDir,
-        this.config.tenantId || '00000000-0000-0000-0000-000000000001',
-        this.config.applicationId || '00000000-0000-0000-0000-000000000002'
-      );
+      const tenantId = this.config.tenantId || '00000000-0000-0000-0000-000000000001';
+      const applicationId = this.config.applicationId || '00000000-0000-0000-0000-000000000002';
+      try {
+        const { loadOrCreateScopedClientId } = await this.loadSdk();
+        this.clientId = await loadOrCreateScopedClientId(
+          this.storageDir,
+          tenantId,
+          applicationId
+        );
+      } catch {
+        try {
+          const { loadOrCreateScopedClientId } = await this.loadSdk();
+          this.clientId = await loadOrCreateScopedClientId(
+            os.tmpdir(),
+            tenantId,
+            applicationId
+          );
+        } catch {
+          this.clientId = randomUUID();
+        }
+      }
     }
     return this.clientId;
   }

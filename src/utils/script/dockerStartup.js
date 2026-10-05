@@ -17,6 +17,16 @@ function assertPostgreSQLDatabase(databaseUrl = process.env.DATABASE_URL) {
 async function main() {
   assertPostgreSQLDatabase();
 
+  // Ensure persistent license storage directory and permissions exist
+  try {
+    const fs = require('fs');
+    const storageDir = process.env.KTX_LICENSE_STORAGE_DIR || '/app/data/secure-license';
+    fs.mkdirSync(storageDir, { recursive: true, mode: 0o777 });
+    try {
+      execSync(`chmod -R 777 "${storageDir}" 2>/dev/null || true`);
+    } catch {}
+  } catch {}
+
   // The checked-in migration history was originally generated for MySQL and
   // cannot be executed by PostgreSQL. Synchronize the current Prisma schema
   // directly until a PostgreSQL migration history is baselined.

@@ -19,9 +19,7 @@ ENV PORT=3200
 
 COPY --from=builder --chown=node:node /app /app
 
-RUN mkdir -p /app/uploads && chown -R node:node /app/uploads
-
-USER node
+RUN mkdir -p /app/uploads /app/data/secure-license
 
 EXPOSE 3200
 

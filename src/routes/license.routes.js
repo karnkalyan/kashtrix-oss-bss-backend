@@ -75,6 +75,12 @@ module.exports = (prisma) => {
   // License status check
   router.get('/status', async (req, res, next) => {
     try {
+      if (!secureLicense.hwid || !secureLicense.clientId) {
+        await Promise.all([
+          secureLicense.getHardwareId(),
+          secureLicense.getClientId(),
+        ]).catch(() => {});
+      }
       const status = secureLicense.getPublicStatus();
       const isp = await getRequestIsp(req);
       const publicIsp = isp || (await getPublicIsp());

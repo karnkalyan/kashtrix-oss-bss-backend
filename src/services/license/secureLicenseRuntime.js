@@ -82,7 +82,7 @@ const getSupportedModules = () => [
   { code: 'AI_AGENTS', name: 'Autonomous AI Agents', description: 'AI copilot and automation workflows' },
   { code: 'TICKETS', name: 'Helpdesk & Workorders', description: 'Customer support ticketing and workorders' },
   { code: 'INVENTORY', name: 'Inventory & Assets', description: 'Warehouse, stock and asset tracking' },
-  { code: 'MAX_SUBSCRIBERS', name: 'Subscriber capacity', description: 'Maximum active broadband subscribers', type: 'integer', min: 0, max: 10000000, step: 1, defaultValue: 1000, unit: 'subscribers' },
+  { code: 'MAX_SUBSCRIBERS', name: 'Subscriber capacity', description: 'Maximum active broadband subscribers', type: 'integer', min: 0, max: 1000000, step: 1, defaultValue: 1000, unit: 'subscribers' },
   { code: 'MAX_DEVICES', name: 'Network devices', description: 'Maximum managed network devices', type: 'integer', min: 0, max: 100000, step: 1, defaultValue: 10, unit: 'devices' },
 ];
 

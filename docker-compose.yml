@@ -18,8 +18,8 @@ services:
       KTX_LICENSE_SERVER_HOST: ${KTX_LICENSE_SERVER_HOST:-license.simulcast.com.np}
       KTX_LICENSE_SERVER_PORT: ${KTX_LICENSE_SERVER_PORT:-7443}
       KTX_LICENSE_SERVERNAME: ${KTX_LICENSE_SERVERNAME:-license.simulcast.com.np}
-      KTX_LICENSE_TENANT_ID: ${KTX_LICENSE_TENANT_ID:-fb86704e-69a7-46fb-8e6d-50b8aa9cec6b}
-      KTX_LICENSE_APPLICATION_ID: ${KTX_LICENSE_APPLICATION_ID:-729a2fba-624b-4e7c-abc7-c51861aad64b}
+      KTX_LICENSE_TENANT_ID: ${KTX_LICENSE_TENANT_ID:-729a2fba-624b-4e7c-abc7-c51861aad64b}
+      KTX_LICENSE_APPLICATION_ID: ${KTX_LICENSE_APPLICATION_ID:-fb86704e-69a7-46fb-8e6d-50b8aa9cec6b}
       KTX_LICENSE_CA_PATH: /run/secrets/license-ca.pem
       KTX_LICENSE_CLIENT_CERT_PATH: /run/secrets/license-client-cert.pem
       KTX_LICENSE_CLIENT_KEY_PATH: /run/secrets/license-client-key.pem

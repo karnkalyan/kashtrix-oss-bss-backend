@@ -1,6 +1,8 @@
 const axios = require('axios');
 const QRCode = require('qrcode');
 const path = require('path');
+const fs = require('fs');
+const { exec } = require('child_process');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
@@ -10,6 +12,66 @@ const whatsappClients = new Map();
 const intentionalDisconnects = new Set();
 const reconnectTimers = new Map();
 const localAuthPath = path.resolve(__dirname, '../../.wwebjs_auth');
+
+let isInstallingPuppeteerBrowser = false;
+
+function resolveChromeExecutablePath() {
+    // 1. Explicit environment overrides
+    const envCandidate = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_BIN || process.env.CHROME_PATH;
+    if (envCandidate) {
+        try {
+            if (fs.existsSync(envCandidate)) return envCandidate;
+        } catch (_) {}
+    }
+
+    // 2. Linux / Docker common paths
+    const linuxCandidates = [
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/google-chrome',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/snap/bin/chromium',
+        '/snap/bin/google-chrome',
+        '/usr/lib/chromium/chromium',
+        '/usr/bin/brave-browser'
+    ];
+    for (const cand of linuxCandidates) {
+        try {
+            if (fs.existsSync(cand)) return cand;
+        } catch (_) {}
+    }
+
+    // 3. Windows common paths
+    const winCandidates = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\Application\\chrome.exe') : null
+    ].filter(Boolean);
+    for (const cand of winCandidates) {
+        try {
+            if (fs.existsSync(cand)) return cand;
+        } catch (_) {}
+    }
+
+    return null;
+}
+
+function triggerBrowserInstall(onComplete) {
+    if (isInstallingPuppeteerBrowser) return;
+    isInstallingPuppeteerBrowser = true;
+    console.log('[WhatsApp Service] Missing browser binary. Auto-executing: npx puppeteer browsers install chrome');
+    exec('npx puppeteer browsers install chrome', { timeout: 180000 }, (error, stdout, stderr) => {
+        isInstallingPuppeteerBrowser = false;
+        if (error) {
+            console.error('[WhatsApp Service] Puppeteer browser install failed:', error.message);
+        } else {
+            console.log('[WhatsApp Service] Puppeteer browser install succeeded:', stdout || stderr);
+        }
+        if (typeof onComplete === 'function') onComplete(error);
+    });
+}
 
 class WhatsAppService {
     constructor() {
@@ -261,11 +323,16 @@ class WhatsAppService {
                 }),
                 puppeteer: {
                     headless: true,
+                    executablePath: resolveChromeExecutablePath() || undefined,
                     args: [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-gpu'
+                        '--disable-gpu',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--single-process',
+                        '--disable-extensions'
                     ]
                 }
             });
@@ -332,6 +399,22 @@ class WhatsAppService {
                 }
             });
 
+            const handlePuppeteerError = (err) => {
+                const msg = String(err?.message || err || '');
+                if (msg.includes('Could not find Chrome') || msg.includes('Failed to launch the browser process') || msg.includes('browser revision')) {
+                    triggerBrowserInstall((installErr) => {
+                        if (!installErr) {
+                            console.log(`[WhatsApp Service] Chrome install finished. Auto-retrying session for ISP ${ispId} in 3s...`);
+                            setTimeout(() => {
+                                this.generateQrSession(ispId, { force: true }).catch(() => {});
+                            }, 3000);
+                        }
+                    });
+                    return 'Chrome browser binary was missing. Installation started automatically in the background (npx puppeteer browsers install chrome). Please wait 30 seconds and click "Retry Session".';
+                }
+                return msg;
+            };
+
             // Start initialization
             client.initialize().catch(err => {
                 console.error('[WhatsApp Service] Client initialization failed:', err.message);
@@ -339,7 +422,7 @@ class WhatsAppService {
                 if (current) {
                     current.state = 'ERROR';
                     current.qrCode = '';
-                    current.error = err.message;
+                    current.error = handlePuppeteerError(err);
                 }
                 whatsappClients.delete(ispId);
             });
@@ -347,8 +430,14 @@ class WhatsAppService {
             whatsappClients.set(ispId, client);
         } catch (err) {
             session.state = 'ERROR';
-            session.error = `WhatsApp Web client could not start: ${err.message}`;
-            console.error('[WhatsApp Service] whatsapp-web.js startup error:', err.message);
+            const msg = String(err?.message || err || '');
+            if (msg.includes('Could not find Chrome') || msg.includes('browser revision')) {
+                triggerBrowserInstall();
+                session.error = 'Chrome browser binary was missing. Installation started in the background. Please wait 30 seconds and click "Retry Session".';
+            } else {
+                session.error = `WhatsApp Web client could not start: ${msg}`;
+            }
+            console.error('[WhatsApp Service] whatsapp-web.js startup error:', msg);
         }
 
         return session;

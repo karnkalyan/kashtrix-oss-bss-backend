@@ -15,6 +15,7 @@ module.exports = (prisma) => {
   router.get('/status', auth, (req, res) => controller.getStatus(req, res));
   router.get('/config', auth, checkPermission('settings_read'), (req, res) => controller.getConfig(req, res));
   router.post('/config', auth, checkPermission('settings_update'), (req, res) => controller.saveConfig(req, res));
+  router.put('/config', auth, checkPermission('settings_update'), (req, res) => controller.saveConfig(req, res));
 
   return router;
 };

@@ -80,6 +80,8 @@ const DeviceStatusService = require('./services/device-management/device-status.
 const managedDeviceConnections = new DeviceConnectionService(prisma);
 const managedDeviceStatus = new DeviceStatusService(prisma, managedDeviceConnections);
 
+require('./utils/initExternalPaymentDb')(prisma).catch(err => console.warn('[initExternalPaymentDb] Warning:', err.message));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

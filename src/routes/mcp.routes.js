@@ -213,21 +213,114 @@ module.exports = (prisma) => {
   router.post('/message', handlePost);
   router.get('/message', handleGet);
 
+  // MCP Settings API
+  router.get('/config', async (req, res, next) => {
+    try {
+      const settings = await prisma.iSPSettings.findMany({
+        where: { key: { startsWith: 'mcp_' } }
+      });
+      const map = {};
+      settings.forEach(s => { map[s.key] = s.value; });
+
+      let disabledTools = [];
+      try {
+        if (map['mcp_disabled_tools']) {
+          disabledTools = JSON.parse(map['mcp_disabled_tools']);
+        }
+      } catch (e) {}
+
+      res.json({
+        enabled: map['mcp_server_enabled'] !== 'false',
+        readOnly: map['mcp_readonly_mode'] !== 'false',
+        authToken: map['mcp_auth_token'] || '',
+        transport: map['mcp_transport'] || 'all',
+        disabledTools: Array.isArray(disabledTools) ? disabledTools : [],
+        allTools: READ_ONLY_TOOLS.map(t => ({
+          name: t.name,
+          description: t.description,
+          enabled: !disabledTools.includes(t.name)
+        }))
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.put('/config', async (req, res, next) => {
+    try {
+      const { enabled, readOnly, authToken, disabledTools, transport } = req.body || {};
+      const updates = [
+        { key: 'mcp_server_enabled', value: String(Boolean(enabled)) },
+        { key: 'mcp_readonly_mode', value: String(readOnly !== false) },
+        { key: 'mcp_auth_token', value: String(authToken || '').trim() },
+        { key: 'mcp_transport', value: String(transport || 'all') },
+        { key: 'mcp_disabled_tools', value: JSON.stringify(Array.isArray(disabledTools) ? disabledTools : []) }
+      ];
+
+      for (const item of updates) {
+        await prisma.iSPSettings.upsert({
+          where: { key: item.key },
+          update: { value: item.value, updatedAt: new Date() },
+          create: { key: item.key, value: item.value, ispId: 1, updatedAt: new Date() }
+        });
+      }
+
+      res.json({ success: true, message: 'MCP configuration updated successfully' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Diagnostic endpoints
-  router.get('/tools', (req, res) => {
-    res.json({
-      name: 'kisan-isp-mcp-server',
-      version: '1.0.0',
-      description: 'Strictly Read-Only MCP Server covering 16 domain resources for Kisan ISP CMS',
-      toolsCount: READ_ONLY_TOOLS.length,
-      tools: READ_ONLY_TOOLS
-    });
+  router.get('/tools', async (req, res) => {
+    try {
+      const setting = await prisma.iSPSettings.findFirst({ where: { key: 'mcp_disabled_tools' } });
+      let disabledTools = [];
+      try {
+        if (setting?.value) disabledTools = JSON.parse(setting.value);
+      } catch (e) {}
+
+      const activeTools = READ_ONLY_TOOLS.filter(t => !disabledTools.includes(t.name));
+
+      res.json({
+        name: 'kisan-isp-mcp-server',
+        version: '1.0.0',
+        description: 'Strictly Read-Only MCP Server covering ISP CMS domain tools',
+        totalToolsCount: READ_ONLY_TOOLS.length,
+        activeToolsCount: activeTools.length,
+        tools: activeTools
+      });
+    } catch (e) {
+      res.json({
+        name: 'kisan-isp-mcp-server',
+        version: '1.0.0',
+        toolsCount: READ_ONLY_TOOLS.length,
+        tools: READ_ONLY_TOOLS
+      });
+    }
   });
 
   router.post('/call-tool', async (req, res, next) => {
     try {
       const { name, arguments: args } = req.body || {};
       if (!name) return res.status(400).json({ error: 'Tool name is required' });
+
+      // Check if MCP server or tool is disabled
+      const serverSetting = await prisma.iSPSettings.findFirst({ where: { key: 'mcp_server_enabled' } });
+      if (serverSetting && serverSetting.value === 'false') {
+        return res.status(403).json({ error: 'MCP server is currently disabled in System Settings.' });
+      }
+
+      const disabledSetting = await prisma.iSPSettings.findFirst({ where: { key: 'mcp_disabled_tools' } });
+      if (disabledSetting && disabledSetting.value) {
+        try {
+          const disabled = JSON.parse(disabledSetting.value);
+          if (Array.isArray(disabled) && disabled.includes(name)) {
+            return res.status(403).json({ error: `Tool '${name}' has been disabled by the system administrator.` });
+          }
+        } catch (e) {}
+      }
+
       const result = await handleToolCall(name, args || {});
       res.json(result);
     } catch (error) {
